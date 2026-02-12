@@ -1,0 +1,10 @@
+Package: spotify-downloader-gui
+Version: 1.0
+Section: utils
+Priority: optional
+Architecture: all
+Depends: python3, python3-tk, ffmpeg, playerctl
+Maintainer: Shadow Scripter itswaleedqureshi@gmail.com
+Description: GUI for Spotify-to-MP3 Converter
+  A simple GUI tool to record Spotify playlists, find YouTube matches,
+  and download MP3s.
