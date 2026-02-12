@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Spotify Downloader
+Comment=Download Spotify Playlists to MP3
+Exec=/usr/bin/spotify-downloader-gui
+Icon=utilities-terminal
+Terminal=false
+Type=Application
+Categories=Utility;AudioVideo;
