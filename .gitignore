@@ -1,2 +1,4 @@
 venv
 music_tagger
+__pycache__
+project_dump.txt
