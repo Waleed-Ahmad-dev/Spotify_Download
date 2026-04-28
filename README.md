@@ -1,195 +1,282 @@
-# Spotify Downloader & Recorder
+<div align="center">
+  <img src="https://img.icons8.com/color/96/000000/spotify--v1.png" alt="Spotify Logo" width="80"/>
+  <img src="https://img.icons8.com/color/96/000000/youtube-play.png" alt="YouTube Logo" width="80"/>
+  
+  <h1>Spotify to MP3 / FLAC / M4A Downloader</h1>
 
-**Author:** Waleed-Ahmad-dev (Shadow Scripter)  
-**Contact:** itswaleedqureshi@gmail.com  
-**Version:** 1.0
+  <p>
+    <strong>A highly modular, professional-grade pipeline for archiving Spotify playlists with pristine audio quality, accurate metadata, and precise lyrics.</strong>
+  </p>
+
+  <p>
+    <a href="https://github.com/Waleed-Ahmad-dev/Spotify_Download/issues"><img src="https://img.shields.io/github/issues/Waleed-Ahmad-dev/Spotify_Download?style=for-the-badge&color=red" alt="Issues"/></a>
+    <a href="https://github.com/Waleed-Ahmad-dev/Spotify_Download/network/members"><img src="https://img.shields.io/github/forks/Waleed-Ahmad-dev/Spotify_Download?style=for-the-badge&color=blue" alt="Forks"/></a>
+    <a href="https://github.com/Waleed-Ahmad-dev/Spotify_Download/stargazers"><img src="https://img.shields.io/github/stars/Waleed-Ahmad-dev/Spotify_Download?style=for-the-badge&color=gold" alt="Stars"/></a>
+    <a href="https://github.com/Waleed-Ahmad-dev/Spotify_Download/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Waleed-Ahmad-dev/Spotify_Download?style=for-the-badge&color=green" alt="License"/></a>
+  </p>
+</div>
+
+<br />
+
+## Table of Contents
+
+- [Project Overview](#project-overview)
+- [Core Features](#core-features)
+- [System Architecture & Project Structure](#system-architecture--project-structure)
+- [Prerequisites](#prerequisites)
+- [Installation Guide](#installation-guide)
+- [Command Line Interface (CLI) Usage](#command-line-interface-cli-usage)
+  - [Recording Playlists](#recording-playlists)
+  - [Searching Tracks](#searching-tracks)
+  - [Downloading & Tagging](#downloading--tagging)
+  - [All-In-One Execution](#all-in-one-execution)
+  - [Library Management (Deduplication)](#library-management-deduplication)
+- [Configuration Reference](#configuration-reference)
+- [Contribution Guidelines](#contribution-guidelines)
+- [Disclaimer & License](#disclaimer--license)
 
 ---
 
 ## Project Overview
 
-The **Spotify Downloader & Recorder** is a powerful, dual-interface (CLI & GUI) tool designed to help you archive your favorite music. Unlike simple downloaders that rely solely on metadata matching, this tool offers a unique **hybrid approach**:
+The **Spotify Downloader** is a sophisticated, command-line driven application designed to flawlessly bridge the gap between streaming playlists and local music archiving. Unlike conventional tools that blindly scrape the web, this software implements a multi-stage pipeline: exact-match recording via system audio interfaces, parallelized high-fidelity downloading from YouTube, and meticulous metadata injection.
 
-1.  **Recording (Linux Only):** It interacts directly with the Linux Media Player Interface (MPRIS) via `playerctl` to capture exact song titles and artists from your running Spotify client while you play them. This ensures 100% accuracy for your specific playlist.
-2.  **Searching:** It uses a robust, verification-heavy search algorithm to find the exact YouTube match for each song.
-3.  **Downloading:** It leverages `yt-dlp` and `ffmpeg` to download high-quality audio and convert it to MP3.
-
-Whether you prefer a terminal environment or a graphical user interface, this project has you covered.
+By integrating seamlessly with APIs like iTunes for track details and LRCLIB for synchronized lyrics, the output is not just a collection of audio files, but a fully structured, locally hosted music library that rivals streaming platforms in organization and metadata depth.
 
 ---
 
-## Features
+## Core Features
 
-- **GUI & CLI Support:** Run the full suite of tools from a user-friendly Tkinter GUI or a scriptable Command Line Interface.
-- **Precision Recording:** Automatically captures song metadata as you listen to your Spotify playlist.
-- **Smart Duplicate Detection:** skips songs that have already been recorded to prevent duplicates in your list.
-- **Robust YouTube Search:** Prioritizes accuracy over speed, verifying results to ensure you get the correct song, not just the first result.
-- **Automated Downloading:** High-quality MP3 extraction (192kbps) with automatic FFmpeg conversion.
-- **Desktop Integration:** Native desktop entry support for Linux environments.
+- **Precision Spotify Recording (Linux Exclusive):** Integrates with the MPRIS D-Bus interface via `playerctl` to dynamically capture exact track titles and artist names directly from the active Spotify client. Features automated loop detection to gracefully terminate the recording phase.
+- **Parallelized Retrieval Engine:** Utilizes Python's `concurrent.futures` to rapidly query YouTube and download audio streams. Automatically resolves rate-limiting and applies fallback mechanisms for maximum reliability.
+- **Multi-Format Lossless & Lossy Extraction:** Leverages `yt-dlp` and `FFmpeg` to extract audio directly into standard MP3, highly efficient M4A (AAC), or studio-quality FLAC containers.
+- **Industry Standard Audio Normalization:** Features optional integration with FFmpeg's `loudnorm` filter to normalize audio output to -14 LUFS, precisely matching Spotify's standard volume levels across diverse tracks.
+- **Comprehensive Metadata Injection:** Dynamically fetches ID3/FLAC/MP4 tags from the iTunes API. Embeds high-resolution cover art (up to 600x600), album details, release dates, and track numbers directly into the audio containers using `mutagen`.
+- **Synchronized Lyrics Support:** Interfaces with LRCLIB to retrieve both plain and time-synchronized lyrics, embedding plain lyrics into the audio file and saving synchronized `.lrc` files side-by-side for compatible music players.
+- **Intelligent Library Deduplication:** Features a dedicated deduplication engine that parses existing directories, compares tracks based on cryptographic hashes, embedded metadata, and lyrics presence, systematically eliminating inferior duplicates.
+- **Rich Terminal User Interface (TUI):** Built with `rich` and `questionary` for an immersive terminal experience, featuring interactive menus, live progress bars with time estimations, and formatted summary tables.
+
+---
+
+## System Architecture & Project Structure
+
+The project strictly adheres to a modular architecture, ensuring separation of concerns and maintainability.
+
+```text
+Spotify_Download/
+├── main.py
+├── recorder.py
+├── youtube.py
+├── metadata.py
+├── utils.py
+├── requirements.txt
+├── build_deb.sh
+├── deb_resources/
+│   ├── control
+│   └── spotify-downloader.desktop
+└── .gitignore
+```
+
+### File Level Documentation
+
+- **`main.py`**
+  - *Purpose:* The central orchestrator and primary Command Line Interface entry point.
+  - *Functionality:* Handles argument parsing using `argparse`, deploys interactive format selection menus via `questionary`, and directs the sequential execution of the recording, searching, downloading, and tagging pipelines. Displays a comprehensive, color-coded summary table upon completion.
+- **`recorder.py`**
+  - *Purpose:* The system-level Spotify interface module.
+  - *Functionality:* Exclusively designed for Linux systems, it utilizes system subprocesses to execute `playerctl` commands. It actively monitors the MPRIS interface to capture the currently playing track and artist. Implements an intelligent loop-detection algorithm to autonomously stop recording when the playlist repeats.
+- **`youtube.py`**
+  - *Purpose:* The search and high-speed retrieval engine.
+  - *Functionality:* Harnesses `yt-dlp` to query YouTube for optimal official audio streams based on the recorded text files. Implements `ThreadPoolExecutor` for concurrent operations, significantly reducing total processing time. Handles stream extraction, format conversion via FFmpeg post-processing, and optional audio normalization parameters.
+- **`metadata.py`**
+  - *Purpose:* The tag enrichment and file organization subsystem.
+  - *Functionality:* Interfaces with the iTunes Search API to resolve pristine track details and the LRCLIB API for localized lyrics. It utilizes the `mutagen` library to safely embed these complex data structures (including binary image data for cover art) directly into the file headers. Additionally, it processes filesystem operations to automatically organize outputs into artist-specific directories.
+- **`utils.py`**
+  - *Purpose:* A centralized library of shared utility functions and system checks.
+  - *Functionality:* Manages the shared `rich.console` environment. Provides critical dependency validation (`check_ffmpeg`, `check_linux_requirements`). Contains the logic for sanitizing filesystem paths, generating `.m3u` playlists that retain original playback order, and hosts the sophisticated metadata-aware deduplication function (`remove_duplicates`).
+- **`requirements.txt`**
+  - *Purpose:* Environment definition.
+  - *Functionality:* Locks down exact Python dependency versions required for stability (e.g., `yt-dlp`, `mutagen`, `rich`, `questionary`).
+- **`build_deb.sh` & `deb_resources/`**
+  - *Purpose:* Deployment and distribution tooling.
+  - *Functionality:* A shell script configured to package the tool into a `.deb` installer for Debian/Ubuntu distributions, utilizing configuration files and standard `.desktop` entries located in `deb_resources` for seamless desktop integration.
 
 ---
 
 ## Prerequisites
 
-Before using the tool, ensure you have the following system dependencies installed.
+### System Requirements
 
-### System Dependencies
+The application relies on external binaries for media processing and system interaction.
 
-- **Python 3.6+**
-- **FFmpeg:** Required for audio conversion.
-- **Playerctl:** Required for Spotify recording (Linux only).
+1. **Python 3.8+**
+2. **FFmpeg:** Strictly required for audio extraction, format conversion, and LUFS normalization.
+3. **Playerctl (Linux Only):** Strictly required if utilizing the `--record` feature to read from Spotify.
 
-#### Install on Ubuntu/Debian:
+**Installation on Debian/Ubuntu:**
 
 ```bash
 sudo apt update
-sudo apt install python3 python3-pip python3-tk ffmpeg playerctl
+sudo apt install python3 python3-pip ffmpeg playerctl
 ```
 
-#### Install on Fedora:
+**Installation on Fedora/RHEL:**
 
 ```bash
-sudo dnf install python3 python3-pip python3-tkinter ffmpeg playerctl
+sudo dnf install python3 python3-pip ffmpeg playerctl
 ```
 
-#### Install on Arch Linux:
+**Installation on macOS (Homebrew):**
 
 ```bash
-sudo pacman -S python python-pip tk ffmpeg playerctl
+brew install python ffmpeg
 ```
 
 ### Python Dependencies
 
-Install the required Python library:
+It is highly recommended to isolate the project environment.
 
 ```bash
-pip install yt-dlp
+pip install -r requirements.txt
 ```
 
 ---
 
-## Installation
+## Installation Guide
 
-### Method 1: Manual Installation (Recommended for Developers)
+### Option 1: Source Installation (Recommended for All Platforms)
 
-1.  **Clone the Repository:**
+1. Clone the repository to your local machine:
 
     ```bash
-    git clone https://github.com/Waleed-Ahmad-dev/download_songs.git
-    cd download_songs
+    git clone https://github.com/Waleed-Ahmad-dev/Spotify_Download.git
+    cd Spotify_Download
     ```
 
-2.  **Set up a Virtual Environment (Optional but Recommended):**
+2. Create and activate a virtual environment:
+
     ```bash
     python3 -m venv venv
-    source venv/bin/activate
-    pip install yt-dlp
+    source venv/bin/activate  # On Windows use: venv\Scripts\activate
     ```
 
-### Method 2: Deb Package (For Debian/Ubuntu Users)
+3. Install dependencies:
 
-If a `.deb` package is provided in the releases:
-
-1.  Download the `spotify-downloader-gui_1.0_all.deb` file.
-2.  Install it using `dpkg`:
     ```bash
-    sudo dpkg -i spotify-downloader-gui_1.0_all.deb
-    sudo apt-get install -f  # Fix any missing dependencies
+    pip install -r requirements.txt
     ```
-3.  Launch the application from your application menu.
+
+### Option 2: Debian Package Installation (Debian/Ubuntu Only)
+
+If you are using a Debian-based Linux distribution, you can build and install a `.deb` package for system-wide access.
+
+1. Navigate to the repository root.
+2. Execute the build script:
+
+    ```bash
+    chmod +x build_deb.sh
+    ./build_deb.sh
+    ```
+
+3. Install the generated package:
+
+    ```bash
+    sudo dpkg -i build/spotify-downloader-gui_1.0_all.deb
+    sudo apt-get install -f
+    ```
 
 ---
 
-## Usage
+## Command Line Interface (CLI) Usage
 
-### Graphical User Interface (GUI)
+The application is operated entirely through `main.py`. The modular design allows you to run individual stages or the entire pipeline autonomously.
 
-To start the GUI:
+### 1. Recording Playlists (Linux Only)
 
-```bash
-python3 gui.py
-```
-
-1.  **Tab 1: Record:**
-    - Open Spotify and start playing your playlist.
-    - Ensure **Shuffle is OFF** and **Repeat is ON**.
-    - Click **Start Recording**. The app will auto-skip through your playlist and record titles.
-    - Click **Stop** when done, then **Save to File**.
-
-2.  **Tab 2: Search:**
-    - Select your recorded songs file (e.g., `my_playlist_songs.txt`).
-    - Click **Start Search**. This process takes time to ensure accuracy.
-
-3.  **Tab 3: Download:**
-    - Select the `found_songs.txt` file generated by the search.
-    - Choose an output folder.
-    - Click **Start Download**.
-
-### Command Line Interface (CLI)
-
-The `main.py` script handles all operations.
-
-**1. Record from Spotify (Linux Only):**
+Capture your currently playing Spotify playlist. Ensure your Spotify client is running, playing the desired playlist, with **Shuffle OFF** and **Repeat ON**.
 
 ```bash
-python3 main.py record -o my_playlist.txt
+python3 main.py --record --input my_playlist.txt
 ```
 
-**2. Search YouTube:**
+### 2. Searching Tracks
+
+Scan YouTube for the most accurate official audio matches based on your recorded text list.
 
 ```bash
-python3 main.py search -i my_playlist.txt -f found.txt -n missing.txt
+python3 main.py --search --input my_playlist.txt --found urls.txt --notfound missing.txt --workers 5
 ```
 
-**3. Download MP3s:**
+### 3. Downloading & Tagging
+
+Process the found URLs, extract the audio, embed iTunes metadata, embed lyrics, and organize the files.
 
 ```bash
-python3 main.py download -i found.txt -o ./music_folder
+python3 main.py --download --format flac --quality 320 --organize --playlist "MyAwesomeMix"
 ```
 
-**4. Run All Steps Sequentially:**
+*Note: If `--format` is omitted, an interactive terminal menu will appear prompting you to select your preferred audio format.*
+
+### 4. All-In-One Execution
+
+Execute the entire pipeline seamlessly from recording to final tagging.
 
 ```bash
-python3 main.py all -p my_playlist.txt
+python3 main.py --all --format mp3 --normalize --organize
 ```
+
+### 5. Library Management (Deduplication)
+
+Clean up an existing music library by removing lower-quality duplicates. The algorithm keeps the version with the highest file size and embedded lyrics.
+
+```bash
+python3 main.py --dedupe /path/to/my/music/library
+```
+
+---
+
+## Configuration Reference
+
+A complete list of arguments accepted by `main.py`:
+
+| Argument | Type | Default | Description |
+| :--- | :---: | :--- | :--- |
+| `--record` | Flag | `False` | Initializes the Spotify recording module to capture tracks into a file. |
+| `--search` | Flag | `False` | Searches YouTube for tracks listed in the input file. |
+| `--download` | Flag | `False` | Downloads audio streams from found URLs and applies metadata tagging. |
+| `--all` | Flag | `False` | Runs the Record, Search, and Download pipelines sequentially. |
+| `--input` | String | `songs.txt` | Target file for reading track lists or saving recorded tracks. |
+| `--found` | String | `found.txt` | Output file for storing successfully matched YouTube URLs. |
+| `--notfound` | String | `not_found.txt` | Output file for logging tracks that yielded no search results. |
+| `--output-dir` | String | `songs` | The target root directory where audio files will be saved. |
+| `--workers` | Integer | `5` | The number of concurrent threads utilized during the search phase. |
+| `--quality` | String | `192` | Bitrate for lossy audio formats. Accepted values: `128`, `192`, `320`. |
+| `--format` | String | Prompts | Target audio container. Accepted values: `mp3`, `flac`, `m4a`. |
+| `--organize` | Flag | `False` | Automatically moves processed files into subdirectories named by Artist. |
+| `--resume` | Flag | `False` | Bypasses the YouTube search phase if the found URL file already exists. |
+| `--normalize` | Flag | `False` | Applies FFmpeg `-14 LUFS` volume normalization to mirror Spotify audio levels. |
+| `--playlist` | String | `None` | Generates an `.m3u` playlist with the specified name preserving record order. |
+| `--dedupe` | String | `None` | Path to a directory. Scans and removes duplicate audio files. Overrides all other flags. |
 
 ---
 
 ## Contribution Guidelines
 
-We welcome contributions from the community! To ensure high code quality and maintainability, please adhere to the following strict guidelines.
+Contributions are highly encouraged to expand functionality, improve efficiency, or resolve issues. To maintain architectural integrity, please adhere to the following workflow:
 
-### 1. Code Style & Standards
-
-- **PEP 8 Compliance:** All Python code must strictly follow PEP 8 standards. Use extensive comments to explain complex logic.
-- **Typing:** Use Python's `typing` module for function arguments and return values.
-- **Docstrings:** Every function and class must have a docstring describing its purpose, parameters, and return integrity.
-- **No Magic Numbers:** Define constants at the top of files instead of using hardcoded values.
-
-### 2. Pull Request (PR) Process
-
-- **Descriptive Titles:** Use conventional commit formats (e.g., `feat: add proxy support`, `fix: resolve gui freeze`).
-- **Detailed Descriptions:** explain _what_ you changed, _why_ you changed it, and _how_ you tested it.
-- **Single Responsibility:** Each PR should address exactly one issue or feature. Do not bundle multiple unrelated changes.
-
-### 3. Testing
-
-- **Manual Verification:** Since this tool interacts with external services (Spotify, YouTube), you must provide proof of manual testing (screenshots or logs) in your PR.
-- **Edge Cases:** Test your changes against edge cases (e.g., songs with special characters, network interruptions, empty files).
-
-### 4. branching Strategy
-
-- `main`: The stable production branch. Do not push directly to main.
-- `develop`: The active development branch. Target your PRs here.
-- Feature branches: `feature/your-feature-name`
-- Bugfix branches: `fix/issue-description`
+1. **Fork the Repository:** Create your own parallel workspace.
+2. **Branch Strategically:** Create a dedicated branch for your feature or bug fix (`git checkout -b feature/advanced-caching` or `git checkout -b fix/youtube-rate-limit`).
+3. **Strict Typing & PEP 8:** Ensure all Python code includes type hints (`typing` module) and strictly conforms to PEP 8 style guidelines.
+4. **Modular Design:** Additions to the core pipeline must be separated into appropriate modules. Avoid monolithic additions to `main.py`.
+5. **Commit Conventionally:** Use standardized commit messages (e.g., `feat: implemented asynchronous I/O for API calls`).
+6. **Pull Request Review:** Submit a detailed PR explaining the motivation, architectural decisions, and testing validation of your changes.
 
 ---
 
-## Disclaimer
+## Disclaimer & License
 
-This tool is for **educational and personal archiving purposes only**. The author (Waleed-Ahmad-dev) does not condone piracy. Please respect the copyright of artists and ensure you have the right to download the content.
+**Important Disclaimer:** This software is provided strictly for educational and personal archiving purposes. The developers and contributors do not endorse, encourage, or facilitate digital piracy or copyright infringement. Users are solely responsible for ensuring they possess the legal rights to access and create personal backups of the media they process using this tool.
 
----
+This project is open-source and distributed under the standard GitHub repository parameters. All third-party APIs (iTunes, LRCLIB, YouTube) are accessed in accordance with standard web request paradigms.
 
-**Copyright © 2026 Waleed-Ahmad-dev (Shadow Scripter). All Rights Reserved.**
+**Copyright © 2026 Waleed-Ahmad-dev.**
