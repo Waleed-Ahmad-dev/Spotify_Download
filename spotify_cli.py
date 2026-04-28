@@ -2,7 +2,7 @@
 """
 Spotify-to-MP3 Converter (CLI Edition)
 Records Spotify playlists, finds YouTube matches, downloads MP3s, tags metadata + lyrics,
-and features a smart duplicate remover.
+features a smart duplicate remover, applies audio volume normalization, and generates M3U playlists.
 """
 
 import os
@@ -182,8 +182,8 @@ def search_youtube(input_file: Path, output_found: Path, output_notfound: Path, 
         f.write("\n".join(not_found_list))
 
 # --- 4. DOWNLOADING (yt-dlp) ---
-def download_track(line: str, output_folder: Path, quality: str = '192') -> Optional[Path]:
-    """Download a single track from YouTube as MP3."""
+def download_track(line: str, output_folder: Path, quality: str = '192', normalize: bool = False) -> Optional[Path]:
+    """Download a single track from YouTube as MP3, optionally normalizing volume."""
     if "|" not in line:
         return None
     song_name, url = [p.strip() for p in line.split("|", 1)]
@@ -205,6 +205,10 @@ def download_track(line: str, output_folder: Path, quality: str = '192') -> Opti
             'preferredquality': quality,
         }],
     }
+    
+    if normalize:
+        ydl_opts['postprocessor_args'] = ['-af', 'loudnorm=I=-14:LRA=11:TP=-1.0']
+
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -218,7 +222,7 @@ def download_track(line: str, output_folder: Path, quality: str = '192') -> Opti
         print(f"Download error for {song_name}: {e}")
         return None
 
-def download_songs(input_file: Path, output_folder: Path, quality: str = '192', max_workers: int = 2) -> List[Tuple[str, Path]]:
+def download_songs(input_file: Path, output_folder: Path, quality: str = '192', max_workers: int = 2, normalize: bool = False) -> List[Tuple[str, Path]]:
     """Download all found songs using parallel workers."""
     if not input_file.exists():
         return []
@@ -228,10 +232,13 @@ def download_songs(input_file: Path, output_folder: Path, quality: str = '192', 
         lines = [l.strip() for l in f if l.strip()]
 
     print(f"\n✓ Downloading {len(lines)} songs to '{output_folder}' (quality {quality}kbps)...")
+    if normalize:
+        print("  ↳ Audio volume normalization enabled (-14 LUFS)")
+        
     downloaded_files = []
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_line = {executor.submit(download_track, line, output_folder, quality): line for line in lines}
+        future_to_line = {executor.submit(download_track, line, output_folder, quality, normalize): line for line in lines}
         for future in concurrent.futures.as_completed(future_to_line):
             filepath = future.result()
             if filepath:
@@ -240,7 +247,7 @@ def download_songs(input_file: Path, output_folder: Path, quality: str = '192', 
 
     return downloaded_files
 
-# --- 5. TAGGING & LYRICS ---
+# --- 5. TAGGING, LYRICS & PLAYLISTS ---
 def search_itunes(query: str) -> Optional[Dict[str, Any]]:
     """Search iTunes API for track metadata."""
     try:
@@ -278,11 +285,9 @@ def embed_metadata(file_path: Path, track_info: Dict[str, Any], plain_lyrics: Op
         if audio.tags is None:
             audio.add_tags()
 
-        # Basic tags
         audio.tags.add(TIT2(encoding=3, text=track_info.get('trackName', '')))
         audio.tags.add(TPE1(encoding=3, text=track_info.get('artistName', '')))
-
-        # Extended tags
+        
         album = track_info.get('collectionName', '')
         if album:
             audio.tags.add(TALB(encoding=3, text=album))
@@ -296,7 +301,6 @@ def embed_metadata(file_path: Path, track_info: Dict[str, Any], plain_lyrics: Op
         if track_number:
             audio.tags.add(TRCK(encoding=3, text=str(track_number)))
 
-        # Cover art (high-res)
         art_url = track_info.get('artworkUrl100', '').replace('100x100bb', '600x600bb')
         if art_url:
             try:
@@ -305,7 +309,6 @@ def embed_metadata(file_path: Path, track_info: Dict[str, Any], plain_lyrics: Op
             except Exception:
                 pass
 
-        # Plain lyrics
         if plain_lyrics:
             audio.tags.add(USLT(encoding=3, lang='eng', desc='', text=plain_lyrics))
 
@@ -322,35 +325,79 @@ def organize_files(file_path: Path, track_info: Dict[str, Any], output_dir: Path
     new_path = new_folder / file_path.name
     if new_path != file_path:
         file_path.rename(new_path)
-        # Also move .lrc if it exists
         lrc_path = file_path.with_suffix('.lrc')
         if lrc_path.exists():
             lrc_path.rename(new_folder / lrc_path.name)
     return new_path
 
-def process_metadata(downloaded_files: List[Tuple[str, Path]], organize: bool = False, output_dir: Path = None) -> None:
-    """Fetch metadata, lyrics, and embed tags for all downloaded files."""
+def process_metadata(downloaded_files: List[Tuple[str, Path]], organize: bool = False, output_dir: Path = None) -> Dict[str, Path]:
+    """Fetch metadata, lyrics, embed tags, and return a dictionary mapping song names to their final paths."""
     print("\n✓ Fetching Metadata and Lyrics...")
+    final_paths = {}
+    
     for song_name, file_path in downloaded_files:
         print(f"Tagging: {song_name}")
         track = search_itunes(song_name)
+        current_path = file_path
+        
         if track:
             duration_sec = track.get('trackTimeMillis', 0) / 1000
             synced_lyrics, plain_lyrics = get_synced_lyrics(track['artistName'], track['trackName'], duration_sec)
 
             if synced_lyrics:
-                save_lrc_file(file_path, synced_lyrics)
+                save_lrc_file(current_path, synced_lyrics)
                 print("  > [SUCCESS] Synced .lrc lyrics saved.")
 
-            embed_metadata(file_path, track, plain_lyrics)
+            embed_metadata(current_path, track, plain_lyrics)
             print("  > [SUCCESS] ID3 Tags & Cover embedded.")
 
             if organize and output_dir:
-                new_path = organize_files(file_path, track, output_dir)
-                print(f"  > [SUCCESS] Moved to {new_path.parent}")
+                current_path = organize_files(current_path, track, output_dir)
+                print(f"  > [SUCCESS] Moved to {current_path.parent}")
         else:
             print("  > [FAILED] Metadata not found.")
-        time.sleep(0.5)  
+            
+        final_paths[song_name] = current_path
+        time.sleep(0.5)
+        
+    return final_paths
+
+def generate_m3u(playlist_name: str, output_dir: Path, original_order_file: Path, final_paths: Dict[str, Path]) -> None:
+    """Generate an .m3u playlist maintaining the original order of the search file."""
+    if not final_paths:
+        return
+        
+    m3u_path = output_dir / f"{sanitize_filename(playlist_name)}.m3u"
+    print(f"\n--- Generating Playlist: {m3u_path.name} ---")
+
+    try:
+        with open(original_order_file, "r", encoding="utf-8") as f:
+            lines = [l.strip() for l in f if l.strip()]
+    except Exception as e:
+        print(f"❌ Could not read order file: {e}")
+        return
+
+    playlist_entries = []
+    for line in lines:
+        if "|" in line:
+            song_name = line.split("|", 1)[0].strip()
+            if song_name in final_paths:
+                # Get the path relative to where the .m3u file is saved (output_dir)
+                try:
+                    rel_path = final_paths[song_name].relative_to(output_dir)
+                    playlist_entries.append(str(rel_path))
+                except ValueError:
+                    # Fallback to absolute path if relative fails for some reason
+                    playlist_entries.append(str(final_paths[song_name]))
+
+    if playlist_entries:
+        with open(m3u_path, "w", encoding="utf-8") as f:
+            f.write("#EXTM3U\n")
+            for entry in playlist_entries:
+                f.write(f"{entry}\n")
+        print(f"✓ Playlist saved successfully with {len(playlist_entries)} tracks.")
+    else:
+        print("⚠️ No tracks were found to add to the playlist.")
 
 # --- 6. DUPLICATE REMOVAL ---
 def remove_duplicates(directory: Path) -> None:
@@ -358,20 +405,16 @@ def remove_duplicates(directory: Path) -> None:
     print(f"\n--- Scanning '{directory}' for duplicates ---")
     song_groups = {}
     
-    # Read metadata for every MP3 in the folder and its subfolders
     for filepath in directory.rglob("*.mp3"):
         try:
             audio = MP3(str(filepath), ID3=ID3)
             
-            # Extract Title safely
             tit2 = audio.tags.getall('TIT2') if audio.tags else []
             title = tit2[0].text[0].lower().strip() if tit2 else filepath.stem.lower().strip()
             
-            # Extract Artist safely
             tpe1 = audio.tags.getall('TPE1') if audio.tags else []
             artist = tpe1[0].text[0].lower().strip() if tpe1 else "unknown"
             
-            # Extract Lyrics safely
             uslt = audio.tags.getall('USLT') if audio.tags else []
             has_lyrics = bool(uslt)
             
@@ -390,14 +433,10 @@ def remove_duplicates(directory: Path) -> None:
         except Exception as e:
             print(f"⚠️ Could not read tags for {filepath.name}: {e}")
 
-    # Process and remove duplicates
     removed_count = 0
     for (title, artist), files in song_groups.items():
         if len(files) > 1:
-            # Sort files: Prioritize files WITH lyrics first, then by largest file size
             files.sort(key=lambda x: (x['has_lyrics'], x['size']), reverse=True)
-            
-            # Keep the highest quality/most complete file
             best_file = files[0]
             duplicates = files[1:]
             
@@ -406,7 +445,6 @@ def remove_duplicates(directory: Path) -> None:
                 print(f"   (Keeping: {best_file['path'].name})")
                 try:
                     dup['path'].unlink()
-                    # Also delete corresponding .lrc file if it exists
                     lrc_path = dup['path'].with_suffix('.lrc')
                     if lrc_path.exists():
                         lrc_path.unlink()
@@ -422,7 +460,7 @@ def main():
     parser.add_argument('--record', action='store_true', help='Record Spotify playlist to songs.txt')
     parser.add_argument('--search', action='store_true', help='Search YouTube for songs in songs.txt')
     parser.add_argument('--download', action='store_true', help='Download found songs & apply metadata')
-    parser.add_argument('--all', action='store_true', help='Run the complete pipeline')
+    parser.add_argument('--all', action='store_true', help='Run the complete pipeline (Record, Search, Download, Normalize)')
 
     parser.add_argument('--input', default='songs.txt', help='Input song list file (default: songs.txt)')
     parser.add_argument('--found', default='found.txt', help='Output file for found URLs (default: found.txt)')
@@ -432,13 +470,12 @@ def main():
     parser.add_argument('--quality', choices=['128', '192', '320'], default='192', help='MP3 bitrate (default: 192)')
     parser.add_argument('--organize', action='store_true', help='Organize MP3s into Artist folders after tagging')
     parser.add_argument('--resume', action='store_true', help='Skip search if found.txt already exists')
-    
-    # New deduplication argument
+    parser.add_argument('--normalize', action='store_true', help='Normalize audio volume to -14 LUFS (Spotify standard)')
+    parser.add_argument('--playlist', type=str, metavar='NAME', help='Generate an .m3u playlist with this name retaining original order')
     parser.add_argument('--dedupe', type=str, metavar='DIR', help='Remove duplicates in a specified directory based on metadata')
 
     args = parser.parse_args()
 
-    # Handle the standalone deduplicate feature first
     if args.dedupe:
         dedupe_dir = Path(args.dedupe)
         if not dedupe_dir.exists() or not dedupe_dir.is_dir():
@@ -455,6 +492,8 @@ def main():
     found_file = Path(args.found)
     notfound_file = Path(args.notfound)
     out_dir = Path(args.output_dir)
+    
+    should_normalize = args.normalize or args.all
 
     if args.record or args.all:
         record_spotify(input_file)
@@ -473,9 +512,14 @@ def main():
             print("❌ No URLs found. Run --search first or remove --resume.")
             sys.exit(1)
 
-        downloaded = download_songs(found_file, out_dir, quality=args.quality, max_workers=2)
+        downloaded = download_songs(found_file, out_dir, quality=args.quality, max_workers=2, normalize=should_normalize)
         if downloaded:
-            process_metadata(downloaded, organize=args.organize, output_dir=out_dir)
+            final_paths = process_metadata(downloaded, organize=args.organize, output_dir=out_dir)
+            
+            # Generate the playlist if requested
+            if args.playlist:
+                generate_m3u(args.playlist, out_dir, found_file, final_paths)
+                
         else:
             print("❌ No songs were downloaded.")
 
