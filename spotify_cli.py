@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Spotify-to-MP3 Converter (CLI Edition)
-Records Spotify playlists, finds YouTube matches, downloads MP3s, and tags metadata + lyrics.
+Records Spotify playlists, finds YouTube matches, downloads MP3s, tags metadata + lyrics,
+and features a smart duplicate remover.
 """
 
 import os
@@ -39,7 +40,6 @@ def sanitize_filename(name: str, max_length: int = 150) -> str:
     """Remove invalid characters and strip trailing spaces/dots (which break Windows paths)."""
     name = re.sub(r'[\\/*?:"<>|]', '', name)
     name = re.sub(r'\s+', ' ', name)
-    # Crucial fix: Windows silently removes trailing dots/spaces, breaking Python Path lookups later
     return name[:max_length].strip('. ')
 
 def check_ffmpeg() -> bool:
@@ -140,7 +140,6 @@ def find_url(song_name: str) -> Dict[str, Any]:
     }
     for _ in range(3):
         try:
-            # Reduced sleep timer since extract_flat hits the API far less aggressively
             time.sleep(random.uniform(0.1, 0.5))
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(query, download=False)
@@ -245,7 +244,6 @@ def download_songs(input_file: Path, output_folder: Path, quality: str = '192', 
 def search_itunes(query: str) -> Optional[Dict[str, Any]]:
     """Search iTunes API for track metadata."""
     try:
-        # Better query formatting (iTunes handles spaces better than hyphens for search)
         clean_query = query.replace('-', ' ')
         url = f"https://itunes.apple.com/search?term={urllib.parse.quote(clean_query)}&media=music&limit=1"
         with urllib.request.urlopen(url) as response:
@@ -276,7 +274,6 @@ def save_lrc_file(audio_path: Path, synced_lyrics: str) -> None:
 def embed_metadata(file_path: Path, track_info: Dict[str, Any], plain_lyrics: Optional[str]) -> None:
     """Embed ID3 tags, cover art, and plain lyrics into MP3."""
     try:
-        # Cast file_path to str to guarantee Mutagen compatibility
         audio = MP3(str(file_path), ID3=ID3)
         if audio.tags is None:
             audio.add_tags()
@@ -354,9 +351,73 @@ def process_metadata(downloaded_files: List[Tuple[str, Path]], organize: bool = 
                 print(f"  > [SUCCESS] Moved to {new_path.parent}")
         else:
             print("  > [FAILED] Metadata not found.")
-        time.sleep(0.5)  # Be gentle with APIs
+        time.sleep(0.5)  
 
-# --- 6. MAIN PIPELINE ---
+# --- 6. DUPLICATE REMOVAL ---
+def remove_duplicates(directory: Path) -> None:
+    """Scans a directory for MP3s and removes duplicates based on Title, Artist, and Lyrics."""
+    print(f"\n--- Scanning '{directory}' for duplicates ---")
+    song_groups = {}
+    
+    # Read metadata for every MP3 in the folder and its subfolders
+    for filepath in directory.rglob("*.mp3"):
+        try:
+            audio = MP3(str(filepath), ID3=ID3)
+            
+            # Extract Title safely
+            tit2 = audio.tags.getall('TIT2') if audio.tags else []
+            title = tit2[0].text[0].lower().strip() if tit2 else filepath.stem.lower().strip()
+            
+            # Extract Artist safely
+            tpe1 = audio.tags.getall('TPE1') if audio.tags else []
+            artist = tpe1[0].text[0].lower().strip() if tpe1 else "unknown"
+            
+            # Extract Lyrics safely
+            uslt = audio.tags.getall('USLT') if audio.tags else []
+            has_lyrics = bool(uslt)
+            
+            file_size = filepath.stat().st_size
+            
+            key = (title, artist)
+            if key not in song_groups:
+                song_groups[key] = []
+                
+            song_groups[key].append({
+                'path': filepath,
+                'has_lyrics': has_lyrics,
+                'size': file_size
+            })
+            
+        except Exception as e:
+            print(f"⚠️ Could not read tags for {filepath.name}: {e}")
+
+    # Process and remove duplicates
+    removed_count = 0
+    for (title, artist), files in song_groups.items():
+        if len(files) > 1:
+            # Sort files: Prioritize files WITH lyrics first, then by largest file size
+            files.sort(key=lambda x: (x['has_lyrics'], x['size']), reverse=True)
+            
+            # Keep the highest quality/most complete file
+            best_file = files[0]
+            duplicates = files[1:]
+            
+            for dup in duplicates:
+                print(f"🗑️ Removing duplicate: {dup['path'].name}")
+                print(f"   (Keeping: {best_file['path'].name})")
+                try:
+                    dup['path'].unlink()
+                    # Also delete corresponding .lrc file if it exists
+                    lrc_path = dup['path'].with_suffix('.lrc')
+                    if lrc_path.exists():
+                        lrc_path.unlink()
+                    removed_count += 1
+                except Exception as e:
+                    print(f"❌ Failed to delete {dup['path'].name}: {e}")
+
+    print(f"\n✓ Deduplication complete. Removed {removed_count} duplicate files.")
+
+# --- 7. MAIN PIPELINE ---
 def main():
     parser = argparse.ArgumentParser(description="Spotify Playlist to MP3 Downloader + Tagger")
     parser.add_argument('--record', action='store_true', help='Record Spotify playlist to songs.txt')
@@ -372,8 +433,20 @@ def main():
     parser.add_argument('--quality', choices=['128', '192', '320'], default='192', help='MP3 bitrate (default: 192)')
     parser.add_argument('--organize', action='store_true', help='Organize MP3s into Artist/Album folders after tagging')
     parser.add_argument('--resume', action='store_true', help='Skip search if found.txt already exists')
+    
+    # New deduplication argument
+    parser.add_argument('--dedupe', type=str, metavar='DIR', help='Remove duplicates in a specified directory based on metadata')
 
     args = parser.parse_args()
+
+    # Handle the standalone deduplicate feature first
+    if args.dedupe:
+        dedupe_dir = Path(args.dedupe)
+        if not dedupe_dir.exists() or not dedupe_dir.is_dir():
+            print(f"❌ Error: Directory '{dedupe_dir}' not found.")
+            sys.exit(1)
+        remove_duplicates(dedupe_dir)
+        sys.exit(0)
 
     if not any([args.record, args.search, args.download, args.all]):
         parser.print_help()
