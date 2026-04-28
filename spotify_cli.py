@@ -314,10 +314,9 @@ def embed_metadata(file_path: Path, track_info: Dict[str, Any], plain_lyrics: Op
         print(f"Error tagging {file_path}: {e}")
 
 def organize_files(file_path: Path, track_info: Dict[str, Any], output_dir: Path) -> Path:
-    """Move MP3 and its .lrc file into Artist/Album subfolder."""
+    """Move MP3 and its .lrc file into an Artist folder."""
     artist = sanitize_filename(track_info.get('artistName', 'Unknown Artist'))
-    album = sanitize_filename(track_info.get('collectionName', 'Unknown Album'))
-    new_folder = output_dir / artist / album
+    new_folder = output_dir / artist
     new_folder.mkdir(parents=True, exist_ok=True)
 
     new_path = new_folder / file_path.name
@@ -431,7 +430,7 @@ def main():
     parser.add_argument('--output-dir', default='songs', help='Directory to save MP3s (default: songs)')
     parser.add_argument('--workers', type=int, default=5, help='Number of search threads (default: 5)')
     parser.add_argument('--quality', choices=['128', '192', '320'], default='192', help='MP3 bitrate (default: 192)')
-    parser.add_argument('--organize', action='store_true', help='Organize MP3s into Artist/Album folders after tagging')
+    parser.add_argument('--organize', action='store_true', help='Organize MP3s into Artist folders after tagging')
     parser.add_argument('--resume', action='store_true', help='Skip search if found.txt already exists')
     
     # New deduplication argument
