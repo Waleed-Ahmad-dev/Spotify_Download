@@ -32,21 +32,15 @@ except ImportError:
     print("❌ mutagen not installed. Install with: pip install mutagen")
     sys.exit(1)
 
-# Optional tqdm for progress bars
-try:
-    from tqdm import tqdm
-    TQDM_AVAILABLE = True
-except ImportError:
-    TQDM_AVAILABLE = False
-
 # --- Platform & Utilities ---
 IS_LINUX = sys.platform.startswith('linux')
 
 def sanitize_filename(name: str, max_length: int = 150) -> str:
-    """Remove invalid characters for both Windows and Linux."""
+    """Remove invalid characters and strip trailing spaces/dots (which break Windows paths)."""
     name = re.sub(r'[\\/*?:"<>|]', '', name)
-    name = re.sub(r'\s+', ' ', name).strip()
-    return name[:max_length]
+    name = re.sub(r'\s+', ' ', name)
+    # Crucial fix: Windows silently removes trailing dots/spaces, breaking Python Path lookups later
+    return name[:max_length].strip('. ')
 
 def check_ffmpeg() -> bool:
     """Check if ffmpeg is available (required by yt-dlp for mp3 conversion)."""
@@ -117,7 +111,6 @@ def record_spotify(output_file: Path) -> None:
 
             next_song()
 
-            # Wait for Spotify to actually change song (max 15 seconds)
             start = time.time()
             while time.time() - start < 15:
                 time.sleep(0.8)
@@ -136,10 +129,10 @@ def record_spotify(output_file: Path) -> None:
 
 # --- 3. SEARCHING (YouTube) ---
 def find_url(song_name: str) -> Dict[str, Any]:
-    """Search YouTube for the song (append 'official audio' to query)."""
+    """Search YouTube for the song using optimized flat extraction."""
     query = f"{song_name} official audio"
     ydl_opts = {
-        'format': 'bestaudio/best',
+        'extract_flat': True,  # Massive speedup: skips downloading video manifests
         'quiet': True,
         'no_warnings': True,
         'default_search': 'ytsearch1',
@@ -147,17 +140,18 @@ def find_url(song_name: str) -> Dict[str, Any]:
     }
     for _ in range(3):
         try:
-            time.sleep(random.uniform(1.0, 3.0))
+            # Reduced sleep timer since extract_flat hits the API far less aggressively
+            time.sleep(random.uniform(0.1, 0.5))
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(query, download=False)
-                video = info['entries'][0] if 'entries' in info else info
+                video = info['entries'][0] if 'entries' in info and info['entries'] else info
                 url = video.get('webpage_url') or video.get('url')
                 if url:
                     return {'song': song_name, 'url': url, 'found': True}
             return {'song': song_name, 'error': 'No results', 'found': False}
         except Exception as e:
             if "429" in str(e):
-                time.sleep(20)
+                time.sleep(10)
     return {'song': song_name, 'error': 'Max retries exceeded', 'found': False}
 
 def search_youtube(input_file: Path, output_found: Path, output_notfound: Path, max_workers: int = 3) -> None:
@@ -197,9 +191,10 @@ def download_track(line: str, output_folder: Path, quality: str = '192') -> Opti
 
     safe_name = sanitize_filename(song_name)
     output_path = output_folder / safe_name
+    expected_file = output_path.with_suffix('.mp3')
 
-    if output_path.with_suffix('.mp3').exists():
-        return output_path.with_suffix('.mp3')
+    if expected_file.exists():
+        return expected_file
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -214,13 +209,18 @@ def download_track(line: str, output_folder: Path, quality: str = '192') -> Opti
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
-        return output_path.with_suffix('.mp3')
+        
+        if expected_file.exists():
+            return expected_file
+        else:
+            print(f"⚠️ Downloaded, but couldn't locate file at: {expected_file}")
+            return None
     except Exception as e:
         print(f"Download error for {song_name}: {e}")
         return None
 
 def download_songs(input_file: Path, output_folder: Path, quality: str = '192', max_workers: int = 2) -> List[Tuple[str, Path]]:
-    """Download all found songs using parallel workers (limited to avoid YouTube blocking)."""
+    """Download all found songs using parallel workers."""
     if not input_file.exists():
         return []
     output_folder.mkdir(parents=True, exist_ok=True)
@@ -245,7 +245,9 @@ def download_songs(input_file: Path, output_folder: Path, quality: str = '192', 
 def search_itunes(query: str) -> Optional[Dict[str, Any]]:
     """Search iTunes API for track metadata."""
     try:
-        url = f"https://itunes.apple.com/search?term={urllib.parse.quote(query)}&media=music&limit=1"
+        # Better query formatting (iTunes handles spaces better than hyphens for search)
+        clean_query = query.replace('-', ' ')
+        url = f"https://itunes.apple.com/search?term={urllib.parse.quote(clean_query)}&media=music&limit=1"
         with urllib.request.urlopen(url) as response:
             data = json.loads(response.read().decode())
             if data['resultCount'] > 0:
@@ -274,7 +276,8 @@ def save_lrc_file(audio_path: Path, synced_lyrics: str) -> None:
 def embed_metadata(file_path: Path, track_info: Dict[str, Any], plain_lyrics: Optional[str]) -> None:
     """Embed ID3 tags, cover art, and plain lyrics into MP3."""
     try:
-        audio = MP3(file_path, ID3=ID3)
+        # Cast file_path to str to guarantee Mutagen compatibility
+        audio = MP3(str(file_path), ID3=ID3)
         if audio.tags is None:
             audio.add_tags()
 
@@ -351,7 +354,7 @@ def process_metadata(downloaded_files: List[Tuple[str, Path]], organize: bool = 
                 print(f"  > [SUCCESS] Moved to {new_path.parent}")
         else:
             print("  > [FAILED] Metadata not found.")
-        time.sleep(1)  # Be gentle with APIs
+        time.sleep(0.5)  # Be gentle with APIs
 
 # --- 6. MAIN PIPELINE ---
 def main():
@@ -361,47 +364,39 @@ def main():
     parser.add_argument('--download', action='store_true', help='Download found songs & apply metadata')
     parser.add_argument('--all', action='store_true', help='Run the complete pipeline')
 
-    # New arguments for flexibility
     parser.add_argument('--input', default='songs.txt', help='Input song list file (default: songs.txt)')
     parser.add_argument('--found', default='found.txt', help='Output file for found URLs (default: found.txt)')
     parser.add_argument('--notfound', default='not_found.txt', help='Output file for missing songs (default: not_found.txt)')
     parser.add_argument('--output-dir', default='songs', help='Directory to save MP3s (default: songs)')
-    parser.add_argument('--workers', type=int, default=3, help='Number of search threads (default: 3)')
+    parser.add_argument('--workers', type=int, default=5, help='Number of search threads (default: 5)')
     parser.add_argument('--quality', choices=['128', '192', '320'], default='192', help='MP3 bitrate (default: 192)')
     parser.add_argument('--organize', action='store_true', help='Organize MP3s into Artist/Album folders after tagging')
     parser.add_argument('--resume', action='store_true', help='Skip search if found.txt already exists')
 
     args = parser.parse_args()
 
-    # If no action specified, show help
     if not any([args.record, args.search, args.download, args.all]):
         parser.print_help()
         sys.exit(0)
 
-    # Convert paths to Path objects
     input_file = Path(args.input)
     found_file = Path(args.found)
     notfound_file = Path(args.notfound)
     out_dir = Path(args.output_dir)
 
-    # Step 1: Record
     if args.record or args.all:
         record_spotify(input_file)
 
-    # Step 2: Search
     if args.search or args.all:
-        # Resume support: skip search if --resume and found.txt exists
         if args.resume and found_file.exists():
             print(f"✓ Found file '{found_file}' exists. Skipping search (--resume).")
         else:
             search_youtube(input_file, found_file, notfound_file, max_workers=args.workers)
 
-    # Step 3: Download & Tag
     if args.download or args.all:
         if not check_ffmpeg():
             sys.exit(1)
 
-        # Only download if found_file has content
         if not found_file.exists() or found_file.stat().st_size == 0:
             print("❌ No URLs found. Run --search first or remove --resume.")
             sys.exit(1)
