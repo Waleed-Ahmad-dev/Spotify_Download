@@ -11,13 +11,13 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 from utils import console, sanitize_filename
 
 def find_url(song_name: str) -> Dict[str, Any]:
-    """Search YouTube for the song using optimized flat extraction."""
-    query = f"{song_name} official audio"
+    """Search YouTube for the song using explicitly constructed URLs."""
+    # Explicitly prefix with ytsearch1: to force yt-dlp to treat it as a search
+    query = f"ytsearch1:{song_name} official audio"
     ydl_opts = {
         'extract_flat': True,
         'quiet': True,
         'no_warnings': True,
-        'default_search': 'ytsearch1',
         'noplaylist': True,
     }
     for _ in range(3):
@@ -25,10 +25,22 @@ def find_url(song_name: str) -> Dict[str, Any]:
             time.sleep(random.uniform(0.1, 0.5))
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(query, download=False)
-                video = info['entries'][0] if 'entries' in info and info['entries'] else info
-                url = video.get('webpage_url') or video.get('url')
-                if url:
-                    return {'song': song_name, 'url': url, 'found': True}
+                
+                # Ensure we actually got search entries back
+                if 'entries' in info and info['entries']:
+                    video = info['entries'][0]
+                    video_id = video.get('id')
+                    
+                    # Construct the URL cleanly using the video ID
+                    if video_id:
+                        url = f"https://www.youtube.com/watch?v={video_id}"
+                        return {'song': song_name, 'url': url, 'found': True}
+                    
+                    # Fallback if no ID but a valid web URL exists
+                    url = video.get('webpage_url') or video.get('url')
+                    if url and str(url).startswith('http'):
+                        return {'song': song_name, 'url': url, 'found': True}
+                        
             return {'song': song_name, 'error': 'No results', 'found': False}
         except Exception as e:
             if "429" in str(e):
