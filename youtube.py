@@ -10,12 +10,24 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 from utils import console, sanitize_filename
 
-# ── Shared yt-dlp extractor args ────────────────────────────────────────────
-# FIX #3: extractor_args silence the "no sdk configured" / nsig warnings that
-# appear in recent yt-dlp builds when using the default web+android clients.
-_EXTRACTOR_ARGS: Dict[str, Any] = {
+# ── yt-dlp extractor args ───────────────────────────────────────────────────
+# Two separate configs because the ios client avoids nsig/sdk warnings during
+# metadata-only extraction (search) but does NOT expose the full set of audio
+# stream formats, causing "Requested format is not available" on every video
+# when used for actual downloads.  The web client has no such restriction.
+
+# Used in find_url (search only – no download, ios is fine here)
+_SEARCH_EXTRACTOR_ARGS: Dict[str, Any] = {
     "youtube": {
-        "player_client": ["ios", "web"],   # ios client avoids nsig decoding
+        "player_client": ["ios", "web"],
+        "skip": ["translated_subs"],
+    }
+}
+
+# Used in download_track – web client exposes all audio formats
+_DOWNLOAD_EXTRACTOR_ARGS: Dict[str, Any] = {
+    "youtube": {
+        "player_client": ["web"],
         "skip": ["translated_subs"],
     }
 }
@@ -43,7 +55,7 @@ def find_url(song_name: str) -> Dict[str, Any]:
         "quiet": True,
         "no_warnings": True,   # FIX #3: suppress noisy sdk/nsig warnings
         "noplaylist": True,
-        "extractor_args": _EXTRACTOR_ARGS,
+        "extractor_args": _SEARCH_EXTRACTOR_ARGS,
     }
 
     for query in search_queries:
@@ -154,13 +166,22 @@ def download_track(
                 final_filepath[0] = Path(fp)
 
     # ── Build yt-dlp options ─────────────────────────────────────────────
+    # Explicit fallback chain: prefer opus/webm (highest quality lossless
+    # transcode to flac/m4a), then anything audio, then full video+audio.
+    # "bestaudio/best" alone fails when the ios player_client is used because
+    # that client only serves a restricted subset of streams.
+    # We use the web client here (_DOWNLOAD_EXTRACTOR_ARGS) to get the full
+    # format list.
     ydl_opts: Dict[str, Any] = {
-        "format": "bestaudio/best",
+        "format": (
+            "bestaudio[ext=webm]/bestaudio[ext=m4a]"
+            "/bestaudio[ext=opus]/bestaudio/best"
+        ),
         "outtmpl": str(output_stem) + ".%(ext)s",
         "quiet": True,
-        "no_warnings": True,      # FIX #3
+        "no_warnings": True,
         "noprogress": True,
-        "extractor_args": _EXTRACTOR_ARGS,   # FIX #3
+        "extractor_args": _DOWNLOAD_EXTRACTOR_ARGS,
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
