@@ -10,13 +10,25 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 from utils import console, sanitize_filename
 
-# ── yt-dlp extractor args ───────────────────────────────────────────────────
-# Two separate configs because the ios client avoids nsig/sdk warnings during
-# metadata-only extraction (search) but does NOT expose the full set of audio
-# stream formats, causing "Requested format is not available" on every video
-# when used for actual downloads.  The web client has no such restriction.
+# ── Client strategies ────────────────────────────────────────────────────────
+#
+# YouTube's web client now requires a Proof-of-Origin (PO) token for bestaudio
+# streams. Without cookies that token is absent and every download fails with
+# "Requested format is not available".
+#
+# The clients below do NOT require a PO token and are tried in order:
+#
+#   android_music  – YouTube Music app client. Best audio format coverage,
+#                    no PO token, no nsig decoding issues.  ← primary
+#   android        – Regular Android client. Broad format support, no PO token.
+#   tv_embedded    – YouTube TV embed. Works for most videos without auth.
+#   (empty)        – yt-dlp built-in defaults. Absolute last resort.
+#
+# For search (metadata-only, no stream download) we keep ios+web because the
+# ios client suppresses nsig/sdk warnings and is perfectly fine for flat
+# extraction.
+# ────────────────────────────────────────────────────────────────────────────
 
-# Used in find_url (search only – no download, ios is fine here)
 _SEARCH_EXTRACTOR_ARGS: Dict[str, Any] = {
     "youtube": {
         "player_client": ["ios", "web"],
@@ -24,106 +36,87 @@ _SEARCH_EXTRACTOR_ARGS: Dict[str, Any] = {
     }
 }
 
-# Used in download_track – web client exposes all audio formats
-_DOWNLOAD_EXTRACTOR_ARGS: Dict[str, Any] = {
-    "youtube": {
-        "player_client": ["web"],
-        "skip": ["translated_subs"],
-    }
-}
+# Tried in order until one succeeds. Each dict is passed as
+# extractor_args["youtube"]. Empty dict = let yt-dlp choose.
+_DOWNLOAD_CLIENT_STRATEGIES: List[Dict[str, Any]] = [
+    {"player_client": ["android_music"],                          "skip": ["translated_subs"]},
+    {"player_client": ["android_music", "android"],               "skip": ["translated_subs"]},
+    {"player_client": ["tv_embedded"],                            "skip": ["translated_subs"]},
+    {"player_client": ["android", "tv_embedded", "web"],          "skip": ["translated_subs"]},
+    {},  # yt-dlp defaults – absolute last resort
+]
+
+# Simple format selector – no container pinning so every client can match.
+# FFmpegExtractAudio converts whatever we get to the requested codec.
+_FORMAT = "bestaudio/best"
 
 
-def find_url(song_name: str) -> Dict[str, Any]:
-    """Search YouTube for the best matching audio URL.
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
-    FIX #4: tries three progressively broader queries so obscure or
-    non-English tracks that return no results for "official audio" still
-    get found.
-
-    FIX #7: retry delay is randomised AND we skip to the next query
-    variant instead of hammering the same one on 429.
-    """
-    # Multiple query strategies – most specific first
-    search_queries = [
-        f"ytsearch1:{song_name} official audio",
-        f"ytsearch1:{song_name} audio",
-        f"ytsearch1:{song_name}",
-    ]
-
-    ydl_opts = {
-        "extract_flat": True,
+def _build_ydl_opts(
+    output_stem: Path,
+    format_ext: str,
+    quality: str,
+    normalize: bool,
+    client_args: Dict[str, Any],
+    pp_hook,
+) -> Dict[str, Any]:
+    """Assemble a yt-dlp options dict for one download attempt."""
+    opts: Dict[str, Any] = {
+        "format": _FORMAT,
+        "outtmpl": str(output_stem) + ".%(ext)s",
         "quiet": True,
-        "no_warnings": True,   # FIX #3: suppress noisy sdk/nsig warnings
-        "noplaylist": True,
-        "extractor_args": _SEARCH_EXTRACTOR_ARGS,
+        "no_warnings": True,
+        "noprogress": True,
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": format_ext,
+                "preferredquality": quality,
+            }
+        ],
+        "postprocessor_hooks": [pp_hook],
     }
-
-    for query in search_queries:
-        for attempt in range(2):
-            try:
-                time.sleep(random.uniform(0.3, 0.9))
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(query, download=False)
-
-                if info and "entries" in info and info["entries"]:
-                    video = info["entries"][0]
-                    video_id = video.get("id")
-                    if video_id:
-                        url = f"https://www.youtube.com/watch?v={video_id}"
-                        return {"song": song_name, "url": url, "found": True}
-
-                    # Fallback: use a pre-built URL from the entry if present
-                    url = video.get("webpage_url") or video.get("url", "")
-                    if url and str(url).startswith("http"):
-                        return {"song": song_name, "url": url, "found": True}
-
-                # No entries returned – try next query immediately
-                break
-
-            except Exception as exc:
-                err_str = str(exc)
-                if "429" in err_str or "Too Many Requests" in err_str:
-                    # Back off and try the next query variant
-                    time.sleep(random.uniform(10, 20))
-                    break   # Move to next query instead of retrying same one
-                if attempt == 1:
-                    break   # Two strikes on this query; move on
-
-    return {"song": song_name, "error": "No results found", "found": False}
+    if client_args:
+        opts["extractor_args"] = {"youtube": client_args}
+    if normalize:
+        # Dict form required by yt-dlp; bare list is silently ignored.
+        opts["postprocessor_args"] = {
+            "ffmpegextractaudio": ["-af", "loudnorm=I=-14:LRA=11:TP=-1.0"]
+        }
+    return opts
 
 
-def _locate_output_file(output_folder: Path, safe_name: str, format_ext: str) -> Optional[Path]:
-    """Return the actual file on disk after yt-dlp runs.
+def _locate_output_file(
+    output_folder: Path, safe_name: str, format_ext: str
+) -> Optional[Path]:
+    """Find the file yt-dlp actually wrote, accounting for its own name mangling.
 
-    FIX #1 / #5: yt-dlp applies its own filename sanitization on top of
-    whatever outtmpl we provide, so the path we *computed* in Python may
-    not match what yt-dlp actually wrote.  We use three progressively
-    wider searches so we always find the file regardless of how yt-dlp
-    renamed it.
+    Two passes only – the "pick newest file" fallback is intentionally omitted
+    because concurrent downloads share the same folder and it would return the
+    wrong file under load.
     """
-    # 1. Exact expected path
+    audio_exts = {f".{format_ext}", ".mp3", ".flac", ".m4a", ".opus", ".webm", ".ogg"}
+
+    # Pass 1 – exact expected path
     exact = output_folder / f"{safe_name}.{format_ext}"
     if exact.exists() and exact.stat().st_size > 0:
         return exact
 
-    # 2. Any file whose stem starts with the safe_name (handles yt-dlp
-    #    appending " (NA)" or truncating long names)
-    audio_exts = {f".{format_ext}", ".mp3", ".flac", ".m4a", ".opus", ".webm", ".ogg"}
-    for candidate in output_folder.iterdir():
-        if candidate.suffix.lower() in audio_exts and candidate.stat().st_size > 0:
-            if candidate.stem.startswith(safe_name[:40]):   # first 40 chars match
-                return candidate
+    # Pass 2 – prefix match (handles yt-dlp truncation / ' (NA)' appends)
+    prefix = safe_name[:40].lower()
+    for f in output_folder.iterdir():
+        if (
+            f.suffix.lower() in audio_exts
+            and f.stat().st_size > 0
+            and f.stem.lower().startswith(prefix)
+        ):
+            return f
 
-    # 3. Last-resort: pick the newest audio file in the folder (only safe
-    #    when we're single-threaded for this folder, but better than None)
-    candidates = sorted(
-        (f for f in output_folder.iterdir()
-         if f.suffix.lower() in audio_exts and f.stat().st_size > 0),
-        key=lambda f: f.stat().st_mtime,
-        reverse=True,
-    )
-    return candidates[0] if candidates else None
+    return None
 
+
+# ── Single-track downloader with strategy retry ───────────────────────────────
 
 def download_track(
     line: str,
@@ -132,89 +125,130 @@ def download_track(
     quality: str = "192",
     normalize: bool = False,
 ) -> Optional[Path]:
-    """Download a single track from YouTube as MP3/FLAC/M4A.
+    """Download one track, escalating through client strategies until one works.
 
-    FIX #1: uses a postprocessor_hook to capture the real output path
-            instead of guessing it from sanitize_filename.
-    FIX #2: postprocessor_args now uses the dict form yt-dlp expects.
-    FIX #3: extractor_args + no_warnings suppress sdk/nsig warnings.
-    FIX #5: falls back to _locate_output_file when the hook fires early
-            or the filepath key is absent.
+    Returns the Path of the audio file on success, None if all strategies fail.
     """
     if "|" not in line:
         return None
 
     song_name, url = [p.strip() for p in line.split("|", 1)]
     safe_name = sanitize_filename(song_name)
-    output_stem = output_folder / safe_name   # no extension yet
+    output_stem = output_folder / safe_name
 
-    # ── Already downloaded? ──────────────────────────────────────────────
-    # FIX #1: check via _locate_output_file, not a hard-coded path guess.
+    # Skip if already downloaded
     existing = _locate_output_file(output_folder, safe_name, format_ext)
     if existing:
         return existing
 
-    # ── Capture the real output path via a hook ──────────────────────────
-    # FIX #5: postprocessor_hooks give us the filename AFTER FFmpeg has
-    # finished renaming/converting the file.
-    final_filepath: List[Optional[Path]] = [None]
+    last_error = ""
 
-    def _pp_hook(d: Dict[str, Any]) -> None:
-        if d.get("status") == "finished":
-            fp = d.get("filepath") or (d.get("info_dict") or {}).get("filepath")
-            if fp:
-                final_filepath[0] = Path(fp)
+    for attempt_idx, client_args in enumerate(_DOWNLOAD_CLIENT_STRATEGIES):
+        final_filepath: List[Optional[Path]] = [None]
 
-    # ── Build yt-dlp options ─────────────────────────────────────────────
-    # Explicit fallback chain: prefer opus/webm (highest quality lossless
-    # transcode to flac/m4a), then anything audio, then full video+audio.
-    # "bestaudio/best" alone fails when the ios player_client is used because
-    # that client only serves a restricted subset of streams.
-    # We use the web client here (_DOWNLOAD_EXTRACTOR_ARGS) to get the full
-    # format list.
-    ydl_opts: Dict[str, Any] = {
-        "format": (
-            "bestaudio[ext=webm]/bestaudio[ext=m4a]"
-            "/bestaudio[ext=opus]/bestaudio/best"
-        ),
-        "outtmpl": str(output_stem) + ".%(ext)s",
+        def _pp_hook(d: Dict[str, Any]) -> None:
+            if d.get("status") == "finished":
+                fp = d.get("filepath") or (d.get("info_dict") or {}).get("filepath")
+                if fp:
+                    final_filepath[0] = Path(fp)
+
+        opts = _build_ydl_opts(
+            output_stem, format_ext, quality, normalize, client_args, _pp_hook
+        )
+
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+
+            # Prefer the path captured by the postprocessor hook
+            if (
+                final_filepath[0]
+                and final_filepath[0].exists()
+                and final_filepath[0].stat().st_size > 0
+            ):
+                return final_filepath[0]
+
+            # Fall back to folder scan
+            found = _locate_output_file(output_folder, safe_name, format_ext)
+            if found:
+                return found
+
+            # yt-dlp reported success but we can't find the file – try next strategy
+            last_error = "file not found after download"
+
+        except Exception as exc:
+            last_error = str(exc)
+
+            if "format is not available" in last_error or "No video formats found" in last_error:
+                # This client doesn't expose the needed formats – try next one
+                continue
+
+            if "429" in last_error or "Too Many Requests" in last_error:
+                # Temporary rate-limit – back off then try next strategy
+                time.sleep(random.uniform(8, 15))
+                continue
+
+            # Other errors: log only on the final attempt to avoid spam
+            if attempt_idx == len(_DOWNLOAD_CLIENT_STRATEGIES) - 1:
+                console.print(
+                    f"[bold red]  ✗ yt-dlp error for '{song_name}':[/bold red] {exc}"
+                )
+
+    return None
+
+
+# ── YouTube search ─────────────────────────────────────────────────────────────
+
+def find_url(song_name: str) -> Dict[str, Any]:
+    """Search YouTube for the best matching audio URL.
+
+    Tries three progressively broader query strings; backs off on 429s.
+    """
+    queries = [
+        f"ytsearch1:{song_name} official audio",
+        f"ytsearch1:{song_name} audio",
+        f"ytsearch1:{song_name}",
+    ]
+
+    opts = {
+        "extract_flat": True,
         "quiet": True,
         "no_warnings": True,
-        "noprogress": True,
-        "extractor_args": _DOWNLOAD_EXTRACTOR_ARGS,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": format_ext,
-                "preferredquality": quality,
-            }
-        ],
-        "postprocessor_hooks": [_pp_hook],   # FIX #5
+        "noplaylist": True,
+        "extractor_args": _SEARCH_EXTRACTOR_ARGS,
     }
 
-    # FIX #2: postprocessor_args must be a dict mapping pp-name → arg list,
-    # not a bare list.  The key must be lowercase and match yt-dlp's
-    # internal name for the postprocessor.
-    if normalize:
-        ydl_opts["postprocessor_args"] = {
-            "ffmpegextractaudio": ["-af", "loudnorm=I=-14:LRA=11:TP=-1.0"]
-        }
+    for query in queries:
+        for attempt in range(2):
+            try:
+                time.sleep(random.uniform(0.3, 0.9))
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(query, download=False)
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+                if info and "entries" in info and info["entries"]:
+                    video = info["entries"][0]
+                    vid_id = video.get("id")
+                    if vid_id:
+                        return {
+                            "song": song_name,
+                            "url": f"https://www.youtube.com/watch?v={vid_id}",
+                            "found": True,
+                        }
+                    url = video.get("webpage_url") or video.get("url", "")
+                    if url and str(url).startswith("http"):
+                        return {"song": song_name, "url": url, "found": True}
 
-        # Priority 1: path captured by the hook
-        if final_filepath[0] and final_filepath[0].exists() and final_filepath[0].stat().st_size > 0:
-            return final_filepath[0]
+                break  # no entries – try next query
 
-        # Priority 2: scan the folder for what yt-dlp actually wrote
-        # FIX #1: this handles yt-dlp's own filename mangling
-        return _locate_output_file(output_folder, safe_name, format_ext)
+            except Exception as exc:
+                err = str(exc)
+                if "429" in err or "Too Many Requests" in err:
+                    time.sleep(random.uniform(10, 20))
+                    break
+                if attempt == 1:
+                    break
 
-    except Exception as exc:
-        console.print(f"[bold red]  ✗ yt-dlp error for '{song_name}':[/bold red] {exc}")
-        return None
+    return {"song": song_name, "error": "No results found", "found": False}
 
 
 def search_youtube(
@@ -223,7 +257,7 @@ def search_youtube(
     output_notfound: Path,
     max_workers: int = 3,
 ) -> None:
-    """Search YouTube for every song in *input_file* using a thread pool."""
+    """Search YouTube for every song in input_file using a thread pool."""
     if not input_file.exists():
         console.print(f"[bold red]❌ Error: '{input_file}' not found.[/bold red]")
         sys.exit(1)
@@ -246,7 +280,6 @@ def search_youtube(
         task = progress.add_task(
             f"[cyan]Searching YouTube for {len(songs)} songs...", total=len(songs)
         )
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_song = {executor.submit(find_url, song): song for song in songs}
             for future in concurrent.futures.as_completed(future_to_song):
@@ -271,6 +304,8 @@ def search_youtube(
     )
 
 
+# ── Batch downloader ──────────────────────────────────────────────────────────
+
 def download_songs(
     input_file: Path,
     output_folder: Path,
@@ -279,7 +314,7 @@ def download_songs(
     max_workers: int = 2,
     normalize: bool = False,
 ) -> List[Tuple[str, Path]]:
-    """Download all found songs using a thread pool."""
+    """Download all songs listed in input_file in parallel."""
     if not input_file.exists():
         return []
     output_folder.mkdir(parents=True, exist_ok=True)
@@ -289,7 +324,7 @@ def download_songs(
 
     console.print()
     if normalize:
-        console.print("[dim italic]↳ Audio volume normalization enabled (-14 LUFS)[/dim italic]")
+        console.print("[dim italic]↳ Audio normalization enabled (-14 LUFS)[/dim italic]")
 
     downloaded_files: List[Tuple[str, Path]] = []
 
@@ -308,13 +343,20 @@ def download_songs(
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             future_to_line = {
-                executor.submit(download_track, line, output_folder, format_ext, quality, normalize): line
+                executor.submit(
+                    download_track, line, output_folder, format_ext, quality, normalize
+                ): line
                 for line in lines
             }
             for future in concurrent.futures.as_completed(future_to_line):
                 line = future_to_line[future]
                 song_name = line.split("|")[0].strip()
-                filepath = future.result()
+                try:
+                    filepath = future.result()
+                except Exception as exc:
+                    progress.console.print(f"[red]❌ Error:[/red] {song_name} — {exc}")
+                    filepath = None
+
                 progress.advance(task)
 
                 if filepath:
