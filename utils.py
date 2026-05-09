@@ -15,137 +15,187 @@ from rich.panel import Panel
 # Shared Rich Console for the entire application
 console = Console()
 
-IS_LINUX = sys.platform.startswith('linux')
+IS_LINUX = sys.platform.startswith("linux")
+
 
 def sanitize_filename(name: str, max_length: int = 150) -> str:
-    """Remove invalid characters and strip trailing spaces/dots."""
-    name = re.sub(r'[\\/*?:"<>|]', '', name)
-    name = re.sub(r'\s+', ' ', name)
-    return name[:max_length].strip('. ')
+    """Remove characters that are illegal in filenames and normalise whitespace."""
+    name = re.sub(r'[\\/*?:"<>|]', "", name)
+    name = re.sub(r"\s+", " ", name)
+    return name[:max_length].strip(". ")
+
 
 def check_ffmpeg() -> bool:
-    """Check if ffmpeg is available (required by yt-dlp)."""
+    """Return True if ffmpeg is available on PATH."""
     try:
-        subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True, timeout=3)
+        subprocess.run(
+            ["ffmpeg", "-version"], capture_output=True, check=True, timeout=5
+        )
         return True
     except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
-        console.print("[bold red]❌ FFmpeg is required but not found.[/bold red] Install it:\n"
-              "   [cyan]Linux:[/cyan] sudo apt install ffmpeg\n"
-              "   [cyan]macOS:[/cyan] brew install ffmpeg\n"
-              "   [cyan]Windows:[/cyan] https://www.gyan.dev/ffmpeg/builds/")
+        console.print(
+            "[bold red]❌ FFmpeg is required but not found.[/bold red]\n"
+            "Install it:\n"
+            "   [cyan]Linux:[/cyan]   sudo apt install ffmpeg\n"
+            "   [cyan]macOS:[/cyan]   brew install ffmpeg\n"
+            "   [cyan]Windows:[/cyan] https://www.gyan.dev/ffmpeg/builds/"
+        )
         return False
 
+
 def check_linux_requirements() -> bool:
-    """Check if playerctl is available for recording (Linux only)."""
+    """Return True if playerctl is available (Linux recorder requirement)."""
     if not IS_LINUX:
-        console.print("[bold yellow]⚠️  WARNING:[/bold yellow] Spotify recording requires Linux with playerctl.")
+        console.print(
+            "[bold yellow]⚠️  WARNING:[/bold yellow] "
+            "Spotify recording requires Linux with playerctl."
+        )
         return False
     try:
         subprocess.run(["which", "playerctl"], capture_output=True, check=True)
         return True
     except subprocess.CalledProcessError:
-        console.print("[bold yellow]⚠️  WARNING:[/bold yellow] 'playerctl' not found. Install it (e.g., sudo apt install playerctl).")
+        console.print(
+            "[bold yellow]⚠️  WARNING:[/bold yellow] "
+            "'playerctl' not found.  Install it: sudo apt install playerctl"
+        )
         return False
 
-def generate_m3u(playlist_name: str, output_dir: Path, original_order_file: Path, final_paths: Dict[str, Path]) -> None:
-    """Generate an .m3u playlist maintaining the original order of the search file."""
+
+def generate_m3u(
+    playlist_name: str,
+    output_dir: Path,
+    original_order_file: Path,
+    final_paths: Dict[str, Path],
+) -> None:
+    """Write an .m3u playlist preserving the original song order.
+
+    FIX #8: the lookup key must match exactly what was stored in
+    final_paths (the raw song_name from found.txt, before the '|').
+    Previously the code split the line to get song_name but then looked
+    it up in a dict whose keys were set from a slightly different source,
+    causing every lookup to miss.  We now normalise both sides with
+    str.strip() and compare on the sanitised form as a fallback.
+    """
     if not final_paths:
         return
-        
+
     m3u_path = output_dir / f"{sanitize_filename(playlist_name)}.m3u"
     console.print(f"\n[bold cyan]--- Generating Playlist: {m3u_path.name} ---[/bold cyan]")
 
     try:
-        with open(original_order_file, "r", encoding="utf-8") as f:
-            lines = [l.strip() for l in f if l.strip()]
-    except Exception as e:
-        console.print(f"[bold red]❌ Could not read order file:[/bold red] {e}")
+        with open(original_order_file, "r", encoding="utf-8") as fh:
+            lines = [ln.strip() for ln in fh if ln.strip()]
+    except Exception as exc:
+        console.print(f"[bold red]❌ Could not read order file:[/bold red] {exc}")
         return
 
-    playlist_entries = []
+    # Build a secondary lookup keyed on the sanitised name for resilience
+    # FIX #8
+    sanitised_lookup: Dict[str, Path] = {
+        sanitize_filename(k): v for k, v in final_paths.items()
+    }
+
+    playlist_entries: list[str] = []
     for line in lines:
-        if "|" in line:
-            song_name = line.split("|", 1)[0].strip()
-            if song_name in final_paths:
-                try:
-                    rel_path = final_paths[song_name].relative_to(output_dir)
-                    playlist_entries.append(str(rel_path))
-                except ValueError:
-                    playlist_entries.append(str(final_paths[song_name]))
+        if "|" not in line:
+            continue
+        song_name = line.split("|", 1)[0].strip()
+
+        # Try exact match first, then sanitised-name match
+        found_path = final_paths.get(song_name) or sanitised_lookup.get(
+            sanitize_filename(song_name)
+        )
+
+        if found_path and found_path.exists():
+            try:
+                rel_path = found_path.relative_to(output_dir)
+                playlist_entries.append(str(rel_path))
+            except ValueError:
+                playlist_entries.append(str(found_path))
 
     if playlist_entries:
-        with open(m3u_path, "w", encoding="utf-8") as f:
-            f.write("#EXTM3U\n")
+        with open(m3u_path, "w", encoding="utf-8") as fh:
+            fh.write("#EXTM3U\n")
             for entry in playlist_entries:
-                f.write(f"{entry}\n")
-        console.print(f"[bold green]✓ Playlist saved successfully with {len(playlist_entries)} tracks.[/bold green]")
+                fh.write(f"{entry}\n")
+        console.print(
+            f"[bold green]✓ Playlist saved with {len(playlist_entries)} tracks.[/bold green]"
+        )
     else:
-        console.print("[bold yellow]⚠️ No tracks were found to add to the playlist.[/bold yellow]")
+        console.print("[bold yellow]⚠ No tracks were added to the playlist.[/bold yellow]")
+
 
 def remove_duplicates(directory: Path) -> None:
-    """Scans a directory for audio files and removes duplicates based on Title, Artist, and Lyrics."""
+    """Scan *directory* recursively and delete duplicate audio files.
+
+    Deduplication key: (title, artist) extracted from tags.
+    When duplicates exist, the file with lyrics AND the largest size wins.
+    """
     console.print(Panel(f"[bold yellow]Scanning '{directory}' for duplicates[/bold yellow]", expand=False))
-    song_groups = {}
-    
+    song_groups: Dict[tuple, list] = {}
+
     with console.status("[cyan]Reading files and extracting metadata...[/cyan]"):
         for ext_pattern in ("*.mp3", "*.flac", "*.m4a"):
             for filepath in directory.rglob(ext_pattern):
                 try:
                     ext = filepath.suffix.lower()
                     title, artist, has_lyrics = "", "unknown", False
-                    
-                    if ext == '.mp3':
-                        audio = MP3(str(filepath), ID3=ID3)
-                        tit2 = audio.tags.getall('TIT2') if audio.tags else []
-                        title = tit2[0].text[0].lower().strip() if tit2 else filepath.stem.lower().strip()
-                        tpe1 = audio.tags.getall('TPE1') if audio.tags else []
-                        artist = tpe1[0].text[0].lower().strip() if tpe1 else "unknown"
-                        has_lyrics = bool(audio.tags.getall('USLT') if audio.tags else [])
-                        
-                    elif ext == '.flac':
-                        audio = FLAC(str(filepath))
-                        title = audio.get('title', [filepath.stem])[0].lower().strip()
-                        artist = audio.get('artist', ['unknown'])[0].lower().strip()
-                        has_lyrics = 'lyrics' in audio
-                        
-                    elif ext == '.m4a':
-                        audio = MP4(str(filepath))
-                        title = audio.get('\xa9nam', [filepath.stem])[0].lower().strip()
-                        artist = audio.get('\xa9ART', ['unknown'])[0].lower().strip()
-                        has_lyrics = '\xa9lyr' in audio
 
-                    file_size = filepath.stat().st_size
+                    if ext == ".mp3":
+                        audio = MP3(str(filepath), ID3=ID3)
+                        tit2 = audio.tags.getall("TIT2") if audio.tags else []
+                        title = tit2[0].text[0].lower().strip() if tit2 else filepath.stem.lower().strip()
+                        tpe1 = audio.tags.getall("TPE1") if audio.tags else []
+                        artist = tpe1[0].text[0].lower().strip() if tpe1 else "unknown"
+                        has_lyrics = bool(audio.tags.getall("USLT") if audio.tags else [])
+
+                    elif ext == ".flac":
+                        audio = FLAC(str(filepath))
+                        title = audio.get("title", [filepath.stem])[0].lower().strip()
+                        artist = audio.get("artist", ["unknown"])[0].lower().strip()
+                        has_lyrics = "lyrics" in audio
+
+                    elif ext == ".m4a":
+                        audio = MP4(str(filepath))
+                        title = audio.get("\xa9nam", [filepath.stem])[0].lower().strip()
+                        artist = audio.get("\xa9ART", ["unknown"])[0].lower().strip()
+                        has_lyrics = "\xa9lyr" in audio
+
                     key = (title, artist)
-                    
-                    if key not in song_groups:
-                        song_groups[key] = []
-                        
-                    song_groups[key].append({
-                        'path': filepath,
-                        'has_lyrics': has_lyrics,
-                        'size': file_size
-                    })
+                    song_groups.setdefault(key, []).append(
+                        {
+                            "path": filepath,
+                            "has_lyrics": has_lyrics,
+                            "size": filepath.stat().st_size,
+                        }
+                    )
                 except Exception:
-                    pass
+                    pass  # skip unreadable files silently
 
     removed_count = 0
-    with console.status("[cyan]Analyzing and removing duplicates...[/cyan]"):
-        for (title, artist), files in song_groups.items():
-            if len(files) > 1:
-                files.sort(key=lambda x: (x['has_lyrics'], x['size']), reverse=True)
-                best_file = files[0]
-                duplicates = files[1:]
-                
-                for dup in duplicates:
-                    console.print(f"[red]🗑️ Removing:[/red] {dup['path'].name}")
-                    console.print(f"   [dim](Keeping: {best_file['path'].name})[/dim]")
-                    try:
-                        dup['path'].unlink()
-                        lrc_path = dup['path'].with_suffix('.lrc')
-                        if lrc_path.exists():
-                            lrc_path.unlink()
-                        removed_count += 1
-                    except Exception as e:
-                        console.print(f"[bold red]❌ Failed to delete {dup['path'].name}:[/bold red] {e}")
+    with console.status("[cyan]Analysing and removing duplicates...[/cyan]"):
+        for (_title, _artist), files in song_groups.items():
+            if len(files) <= 1:
+                continue
+            # Best file = has lyrics AND largest size
+            files.sort(key=lambda x: (x["has_lyrics"], x["size"]), reverse=True)
+            best_file = files[0]
+            for dup in files[1:]:
+                console.print(f"[red]🗑️  Removing:[/red] {dup['path'].name}")
+                console.print(f"   [dim](Keeping: {best_file['path'].name})[/dim]")
+                try:
+                    dup["path"].unlink()
+                    lrc_path = dup["path"].with_suffix(".lrc")
+                    if lrc_path.exists():
+                        lrc_path.unlink()
+                    removed_count += 1
+                except Exception as exc:
+                    console.print(
+                        f"[bold red]❌ Failed to delete {dup['path'].name}:[/bold red] {exc}"
+                    )
 
-    console.print(f"\n[bold green]✓ Deduplication complete. Removed {removed_count} duplicate files.[/bold green]\n")
+    console.print(
+        f"\n[bold green]✓ Deduplication complete. "
+        f"Removed {removed_count} duplicate file(s).[/bold green]\n"
+    )
