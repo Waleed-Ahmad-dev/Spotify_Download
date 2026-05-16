@@ -1,3 +1,12 @@
+#!/usr/bin/env python3
+"""
+utils.py
+Shared utilities: console, filename sanitization, ffmpeg check,
+M3U playlist generation, and audio deduplication.
+
+Updated: added .opus support throughout remove_duplicates().
+"""
+
 import os
 import sys
 import re
@@ -5,14 +14,14 @@ import subprocess
 from pathlib import Path
 from typing import Dict
 
-from mutagen.mp3 import MP3
-from mutagen.id3 import ID3
+from mutagen.mp3  import MP3
+from mutagen.id3  import ID3
 from mutagen.flac import FLAC
-from mutagen.mp4 import MP4
+from mutagen.mp4  import MP4
 from rich.console import Console
-from rich.panel import Panel
+from rich.panel   import Panel
 
-# Shared Rich Console for the entire application
+# Shared Rich console for the entire application
 console = Console()
 
 IS_LINUX = sys.platform.startswith("linux")
@@ -63,20 +72,12 @@ def check_linux_requirements() -> bool:
 
 
 def generate_m3u(
-    playlist_name: str,
-    output_dir: Path,
+    playlist_name:      str,
+    output_dir:         Path,
     original_order_file: Path,
-    final_paths: Dict[str, Path],
+    final_paths:        Dict[str, Path],
 ) -> None:
-    """Write an .m3u playlist preserving the original song order.
-
-    FIX #8: the lookup key must match exactly what was stored in
-    final_paths (the raw song_name from found.txt, before the '|').
-    Previously the code split the line to get song_name but then looked
-    it up in a dict whose keys were set from a slightly different source,
-    causing every lookup to miss.  We now normalise both sides with
-    str.strip() and compare on the sanitised form as a fallback.
-    """
+    """Write an .m3u playlist preserving the original song order."""
     if not final_paths:
         return
 
@@ -90,8 +91,6 @@ def generate_m3u(
         console.print(f"[bold red]❌ Could not read order file:[/bold red] {exc}")
         return
 
-    # Build a secondary lookup keyed on the sanitised name for resilience
-    # FIX #8
     sanitised_lookup: Dict[str, Path] = {
         sanitize_filename(k): v for k, v in final_paths.items()
     }
@@ -102,7 +101,6 @@ def generate_m3u(
             continue
         song_name = line.split("|", 1)[0].strip()
 
-        # Try exact match first, then sanitised-name match
         found_path = final_paths.get(song_name) or sanitised_lookup.get(
             sanitize_filename(song_name)
         )
@@ -126,17 +124,35 @@ def generate_m3u(
         console.print("[bold yellow]⚠ No tracks were added to the playlist.[/bold yellow]")
 
 
-def remove_duplicates(directory: Path) -> None:
-    """Scan *directory* recursively and delete duplicate audio files.
+def _read_opus_tags(filepath: Path) -> tuple[str, str, bool]:
+    """Read title, artist, has_lyrics from an Opus file."""
+    try:
+        from mutagen.oggopus import OggOpus
+        audio = OggOpus(str(filepath))
+        title      = audio.get("title",  [filepath.stem])[0].lower().strip()
+        artist     = audio.get("artist", ["unknown"])[0].lower().strip()
+        has_lyrics = "lyrics" in audio
+        return title, artist, has_lyrics
+    except Exception:
+        return filepath.stem.lower().strip(), "unknown", False
 
-    Deduplication key: (title, artist) extracted from tags.
-    When duplicates exist, the file with lyrics AND the largest size wins.
+
+def remove_duplicates(directory: Path) -> None:
     """
-    console.print(Panel(f"[bold yellow]Scanning '{directory}' for duplicates[/bold yellow]", expand=False))
+    Scan *directory* recursively and delete duplicate audio files.
+
+    Deduplication key: (title, artist) from tags.
+    When duplicates exist, the file with lyrics AND the largest size wins.
+    Supports .mp3  .flac  .m4a  .opus
+    """
+    console.print(
+        Panel(f"[bold yellow]Scanning '{directory}' for duplicates[/bold yellow]", expand=False)
+    )
     song_groups: Dict[tuple, list] = {}
 
-    with console.status("[cyan]Reading files and extracting metadata...[/cyan]"):
-        for ext_pattern in ("*.mp3", "*.flac", "*.m4a"):
+    with console.status("[cyan]Reading files and extracting metadata…[/cyan]"):
+        # All supported extensions including Opus
+        for ext_pattern in ("*.mp3", "*.flac", "*.m4a", "*.opus"):
             for filepath in directory.rglob(ext_pattern):
                 try:
                     ext = filepath.suffix.lower()
@@ -145,50 +161,51 @@ def remove_duplicates(directory: Path) -> None:
                     if ext == ".mp3":
                         audio = MP3(str(filepath), ID3=ID3)
                         tit2 = audio.tags.getall("TIT2") if audio.tags else []
-                        title = tit2[0].text[0].lower().strip() if tit2 else filepath.stem.lower().strip()
-                        tpe1 = audio.tags.getall("TPE1") if audio.tags else []
+                        title  = tit2[0].text[0].lower().strip() if tit2 else filepath.stem.lower()
+                        tpe1   = audio.tags.getall("TPE1") if audio.tags else []
                         artist = tpe1[0].text[0].lower().strip() if tpe1 else "unknown"
                         has_lyrics = bool(audio.tags.getall("USLT") if audio.tags else [])
 
                     elif ext == ".flac":
-                        audio = FLAC(str(filepath))
-                        title = audio.get("title", [filepath.stem])[0].lower().strip()
-                        artist = audio.get("artist", ["unknown"])[0].lower().strip()
+                        audio      = FLAC(str(filepath))
+                        title      = audio.get("title",  [filepath.stem])[0].lower().strip()
+                        artist     = audio.get("artist", ["unknown"])[0].lower().strip()
                         has_lyrics = "lyrics" in audio
 
                     elif ext == ".m4a":
-                        audio = MP4(str(filepath))
-                        title = audio.get("\xa9nam", [filepath.stem])[0].lower().strip()
-                        artist = audio.get("\xa9ART", ["unknown"])[0].lower().strip()
+                        audio      = MP4(str(filepath))
+                        title      = audio.get("\xa9nam", [filepath.stem])[0].lower().strip()
+                        artist     = audio.get("\xa9ART", ["unknown"])[0].lower().strip()
                         has_lyrics = "\xa9lyr" in audio
 
+                    elif ext == ".opus":
+                        title, artist, has_lyrics = _read_opus_tags(filepath)
+
                     key = (title, artist)
-                    song_groups.setdefault(key, []).append(
-                        {
-                            "path": filepath,
-                            "has_lyrics": has_lyrics,
-                            "size": filepath.stat().st_size,
-                        }
-                    )
+                    song_groups.setdefault(key, []).append({
+                        "path":       filepath,
+                        "has_lyrics": has_lyrics,
+                        "size":       filepath.stat().st_size,
+                    })
                 except Exception:
-                    pass  # skip unreadable files silently
+                    pass   # skip unreadable files silently
 
     removed_count = 0
-    with console.status("[cyan]Analysing and removing duplicates...[/cyan]"):
+    with console.status("[cyan]Analysing and removing duplicates…[/cyan]"):
         for (_title, _artist), files in song_groups.items():
             if len(files) <= 1:
                 continue
-            # Best file = has lyrics AND largest size
+            # Best = has lyrics AND largest size
             files.sort(key=lambda x: (x["has_lyrics"], x["size"]), reverse=True)
-            best_file = files[0]
+            best = files[0]
             for dup in files[1:]:
                 console.print(f"[red]🗑️  Removing:[/red] {dup['path'].name}")
-                console.print(f"   [dim](Keeping: {best_file['path'].name})[/dim]")
+                console.print(f"   [dim](Keeping: {best['path'].name})[/dim]")
                 try:
                     dup["path"].unlink()
-                    lrc_path = dup["path"].with_suffix(".lrc")
-                    if lrc_path.exists():
-                        lrc_path.unlink()
+                    lrc = dup["path"].with_suffix(".lrc")
+                    if lrc.exists():
+                        lrc.unlink()
                     removed_count += 1
                 except Exception as exc:
                     console.print(
