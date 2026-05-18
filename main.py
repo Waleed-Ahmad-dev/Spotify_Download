@@ -26,6 +26,7 @@ except ImportError:
 try:
     import questionary
     from questionary import Style as QStyle
+    from questionary import Choice
     _HAS_Q = True
 except ImportError:
     questionary = None
@@ -39,14 +40,14 @@ from metadata import process_metadata
 
 # ── Questionary style (matches Rich cyan/magenta theme) ──────────────────────
 _Q_STYLE = QStyle([
-    ("qmark",        "fg:#00d7ff bold"),
-    ("question",     "bold"),
-    ("answer",       "fg:#ff79c6 bold"),
-    ("pointer",      "fg:#00d7ff bold"),
-    ("highlighted",  "fg:#00d7ff bold"),
-    ("selected",     "fg:#ff79c6"),
-    ("separator",    "fg:#6272a4"),
-    ("instruction",  "fg:#6272a4 italic"),
+    ("qmark",       "fg:#00d7ff bold"),
+    ("question",    "bold"),
+    ("answer",      "fg:#ff79c6 bold"),
+    ("pointer",     "fg:#00d7ff bold"),
+    ("highlighted", "fg:#00d7ff bold"),
+    ("selected",    "fg:#ff79c6"),
+    ("separator",   "fg:#6272a4"),
+    ("instruction", "fg:#6272a4 italic"),
 ]) if _HAS_Q else None
 
 
@@ -55,28 +56,62 @@ _Q_STYLE = QStyle([
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ask_select(message: str, choices: list, default: str = None) -> str:
-    """Single-choice menu. Returns the chosen value string."""
+    """
+    Single-choice menu.  Returns the chosen *value* string.
+
+    ``choices`` may be plain strings or dicts with keys "name" and "value".
+    ``default`` should be a *value* string; this function resolves it to the
+    matching ``name`` before handing it to questionary (which requires the
+    name, not the value, as the default).
+    """
     if _HAS_Q:
-        # choices can be strings or {"name": ..., "value": ...} dicts
+        # Build questionary Choice objects and resolve the default → name
+        q_choices = []
+        resolved_default = None          # will be set to the name string
+
+        for c in choices:
+            if isinstance(c, dict):
+                name  = c["name"]
+                value = c["value"]
+            else:
+                name  = c
+                value = c
+
+            q_choices.append(Choice(title=name, value=value))
+
+            # Match the caller-supplied default (which is a value) to the name
+            if default is not None and value == default:
+                resolved_default = name
+
         result = questionary.select(
-            message, choices=choices, default=default, style=_Q_STYLE
+            message,
+            choices=q_choices,
+            default=resolved_default,   # questionary needs the *name*
+            style=_Q_STYLE,
         ).ask()
+
         if result is None:
             _abort()
-        return result
+        return result          # questionary returns the *value* from Choice
+
     else:
-        # Plain-text fallback
+        # Plain-text fallback — works without questionary installed
         console.print(f"\n[bold]{message}[/bold]")
-        items = []
+        items_value = []
+        items_name  = []
         for i, c in enumerate(choices, 1):
-            label = c["name"] if isinstance(c, dict) else c
+            label = c["name"]  if isinstance(c, dict) else c
             value = c["value"] if isinstance(c, dict) else c
-            items.append(value)
-            console.print(f"  [cyan]{i}[/cyan]. {label}")
+            items_value.append(value)
+            items_name.append(label)
+            marker = " [dim](default)[/dim]" if value == default else ""
+            console.print(f"  [cyan]{i}[/cyan]. {label}{marker}")
         while True:
             raw = input("  Enter number: ").strip()
-            if raw.isdigit() and 1 <= int(raw) <= len(items):
-                return items[int(raw) - 1]
+            if not raw and default:
+                return default
+            if raw.isdigit() and 1 <= int(raw) <= len(items_value):
+                return items_value[int(raw) - 1]
             console.print("  [red]Invalid choice, try again.[/red]")
 
 
@@ -140,7 +175,7 @@ def _banner():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Manual song entry (unchanged logic, kept here for self-containment)
+# Manual song entry
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _manual_entry(output_file: Path, append: bool = False) -> int:
@@ -257,7 +292,7 @@ def _wizard():
         _sp.run(cmd)
         return
 
-    # ── Common path questions (used by most modes) ────────────────────────────
+    # ── Common path questions ─────────────────────────────────────────────────
     songs_file = _ask_path("Song list file", "songs.txt")
     out_dir    = _ask_path("Output folder for audio files", "songs")
 
@@ -265,14 +300,15 @@ def _wizard():
     do_manual = False
     do_search = False
     do_dl     = False
+    found_file_check = None
 
     if mode == MODE_FULL:
         source = _ask_select(
             "How will you provide the song list?",
             choices=[
-                {"name": "✏️   Type song names here (manual entry)",                 "value": "manual"},
-                {"name": "🎙️  Record from Spotify via playerctl (Linux only)",        "value": "record"},
-                {"name": "📄  Use existing songs.txt (already have one)",             "value": "existing"},
+                {"name": "✏️   Type song names here (manual entry)",          "value": "manual"},
+                {"name": "🎙️  Record from Spotify via playerctl (Linux only)", "value": "record"},
+                {"name": "📄  Use existing songs.txt (already have one)",      "value": "existing"},
             ],
         )
         if source == "manual":
@@ -314,19 +350,19 @@ def _wizard():
             quality = _ask_select(
                 "Audio bitrate (kbps)",
                 choices=[
-                    {"name": "256 kbps  — excellent, barely any difference from 320",  "value": "256"},
                     {"name": "192 kbps  — great quality, smaller files  (recommended)", "value": "192"},
-                    {"name": "320 kbps  — maximum lossy quality, largest files",        "value": "320"},
-                    {"name": "128 kbps  — acceptable, very small files",               "value": "128"},
+                    {"name": "256 kbps  — excellent, barely any difference from 320",   "value": "256"},
+                    {"name": "320 kbps  — maximum lossy quality, largest files",         "value": "320"},
+                    {"name": "128 kbps  — acceptable, very small files",                "value": "128"},
                 ],
                 default="192",
             )
 
     # ── Optional features ─────────────────────────────────────────────────────
-    organize  = False
-    normalize = False
-    playlist  = None
-    retry_tag = False
+    organize       = False
+    normalize      = False
+    playlist       = None
+    retry_tag      = False
     use_whisper    = False
     whisper_model  = "small"
     whisper_lang   = None
@@ -341,9 +377,9 @@ def _wizard():
         workers_str = _ask_select(
             "Number of parallel YouTube search threads",
             choices=[
-                {"name": "3  — slow network / gentle on YouTube",  "value": "3"},
-                {"name": "5  — balanced  (recommended)",           "value": "5"},
-                {"name": "10 — fast network",                      "value": "10"},
+                {"name": "3  — slow network / gentle on YouTube", "value": "3"},
+                {"name": "5  — balanced  (recommended)",          "value": "5"},
+                {"name": "10 — fast network",                     "value": "10"},
             ],
             default="5",
         )
@@ -356,7 +392,7 @@ def _wizard():
             )
 
     if do_dl:
-        organize  = _ask_confirm("Organise files into Artist sub-folders?",    default=False)
+        organize  = _ask_confirm("Organise files into Artist sub-folders?",       default=False)
         normalize = _ask_confirm("Normalise volume to -14 LUFS (Spotify level)?", default=False)
 
         want_playlist = _ask_confirm("Generate an .m3u playlist file?", default=False)
@@ -377,16 +413,17 @@ def _wizard():
             whisper_model = _ask_select(
                 "Whisper model size",
                 choices=[
-                    {"name": "tiny   — fastest, least accurate",              "value": "tiny"},
-                    {"name": "base   — fast, decent accuracy",                "value": "base"},
-                    {"name": "small  — good balance  (recommended)",          "value": "small"},
-                    {"name": "medium — better accuracy, needs ~5 GB RAM",     "value": "medium"},
-                    {"name": "large  — best accuracy, needs ~10 GB RAM",      "value": "large"},
+                    {"name": "small  — good balance  (recommended)",      "value": "small"},
+                    {"name": "tiny   — fastest, least accurate",           "value": "tiny"},
+                    {"name": "base   — fast, decent accuracy",             "value": "base"},
+                    {"name": "medium — better accuracy, needs ~5 GB RAM",  "value": "medium"},
+                    {"name": "large  — best accuracy, needs ~10 GB RAM",   "value": "large"},
                 ],
                 default="small",
             )
             want_lang = _ask_confirm(
-                "Force a specific language for Whisper? (No = auto-detect)", default=False
+                "Force a specific language for Whisper? (No = auto-detect)",
+                default=False,
             )
             if want_lang:
                 whisper_lang = _ask_text(
@@ -402,14 +439,14 @@ def _wizard():
             browser = _ask_select(
                 "Which browser are you logged into YouTube with?",
                 choices=[
-                    {"name": "Chrome",    "value": "chrome"},
-                    {"name": "Firefox",   "value": "firefox"},
-                    {"name": "Edge",      "value": "edge"},
-                    {"name": "Chromium",  "value": "chromium"},
-                    {"name": "Brave",     "value": "brave"},
-                    {"name": "Safari",    "value": "safari"},
-                    {"name": "Opera",     "value": "opera"},
-                    {"name": "Vivaldi",   "value": "vivaldi"},
+                    {"name": "Chrome",   "value": "chrome"},
+                    {"name": "Firefox",  "value": "firefox"},
+                    {"name": "Edge",     "value": "edge"},
+                    {"name": "Chromium", "value": "chromium"},
+                    {"name": "Brave",    "value": "brave"},
+                    {"name": "Safari",   "value": "safari"},
+                    {"name": "Opera",    "value": "opera"},
+                    {"name": "Vivaldi",  "value": "vivaldi"},
                 ],
                 default="chrome",
             )
@@ -422,29 +459,29 @@ def _wizard():
         title="📋  Run Plan", show_header=True,
         header_style="bold magenta", box=box.ROUNDED,
     )
-    summary_tbl.add_column("Setting", style="cyan")
-    summary_tbl.add_column("Value",   style="green")
+    summary_tbl.add_column("Setting",      style="cyan")
+    summary_tbl.add_column("Value",        style="green")
 
     steps = []
     if do_record: steps.append("Record Spotify playlist")
     if do_manual: steps.append("Manual song entry")
     if do_search: steps.append("Search YouTube")
     if do_dl:     steps.append("Download + Tag")
-    summary_tbl.add_row("Steps",        " → ".join(steps))
-    summary_tbl.add_row("Song list",    str(songs_file))
-    summary_tbl.add_row("Output folder",str(out_dir))
+    summary_tbl.add_row("Steps",         " → ".join(steps) if steps else "—")
+    summary_tbl.add_row("Song list",     str(songs_file))
+    summary_tbl.add_row("Output folder", str(out_dir))
 
     if do_dl:
-        summary_tbl.add_row("Format",      audio_format.upper())
+        summary_tbl.add_row("Format",    audio_format.upper())
         if audio_format != "flac":
-            summary_tbl.add_row("Bitrate",  f"{quality} kbps")
-        summary_tbl.add_row("Organize",    "Yes (by Artist)" if organize else "No")
-        summary_tbl.add_row("Normalize",   "Yes (-14 LUFS)"  if normalize else "No")
-        summary_tbl.add_row("Playlist",    playlist if playlist else "No")
-        summary_tbl.add_row("Retry tags",  "Yes"             if retry_tag else "No")
-        summary_tbl.add_row("Whisper",     f"Yes ({whisper_model})" if use_whisper else "No")
-        summary_tbl.add_row("Cookies",     next(iter(cookie_cfg.values()))[0]
-                                           if cookie_cfg else "No")
+            summary_tbl.add_row("Bitrate", f"{quality} kbps")
+        summary_tbl.add_row("Organize",  "Yes (by Artist)" if organize  else "No")
+        summary_tbl.add_row("Normalize", "Yes (-14 LUFS)"  if normalize else "No")
+        summary_tbl.add_row("Playlist",  playlist           if playlist  else "No")
+        summary_tbl.add_row("Retry tags","Yes"              if retry_tag else "No")
+        summary_tbl.add_row("Whisper",   f"Yes ({whisper_model})" if use_whisper else "No")
+        summary_tbl.add_row("Cookies",
+            next(iter(cookie_cfg.values()))[0] if cookie_cfg else "No")
 
     console.print(summary_tbl)
     console.print()
@@ -471,9 +508,7 @@ def _wizard():
     # 3. Search
     if do_search:
         if resume and found_file.exists():
-            console.print(
-                f"[bold green]✓ Reusing existing '{found_file}'.[/bold green]"
-            )
+            console.print(f"[bold green]✓ Reusing existing '{found_file}'.[/bold green]")
         else:
             search_youtube(songs_file, found_file, notfound_file, max_workers=workers)
 
@@ -482,9 +517,8 @@ def _wizard():
         if not check_ffmpeg():
             sys.exit(1)
 
-        # In download-only mode the user may have given a different found.txt path
-        if mode == MODE_DOWNLOAD:
-            found_file = found_file_check  # type: ignore[name-defined]
+        if mode == MODE_DOWNLOAD and found_file_check is not None:
+            found_file = found_file_check
 
         if not found_file.exists() or found_file.stat().st_size == 0:
             console.print("[bold red]❌  No URLs to download. Run search first.[/bold red]")
@@ -556,15 +590,15 @@ def _wizard():
         )
         done_tbl.add_column("Task",   style="cyan")
         done_tbl.add_column("Result", justify="right", style="green")
-        done_tbl.add_row("Downloaded",    str(len(downloaded)))
-        done_tbl.add_row("Format",        audio_format.upper())
-        done_tbl.add_row("Quality",       "Lossless" if audio_format == "flac" else f"{quality} kbps")
-        done_tbl.add_row("Tagged",        str(len(final_paths)))
-        if normalize:    done_tbl.add_row("Normalised", "Yes (-14 LUFS)")
-        if organize:     done_tbl.add_row("Organised",  "By Artist")
-        if playlist:     done_tbl.add_row("Playlist",   f"{playlist}.m3u")
-        if use_whisper:  done_tbl.add_row("Whisper",    f"Model: {whisper_model}")
-        if cookie_cfg:   done_tbl.add_row("Cookies",    next(iter(cookie_cfg.values()))[0])
+        done_tbl.add_row("Downloaded", str(len(downloaded)))
+        done_tbl.add_row("Format",     audio_format.upper())
+        done_tbl.add_row("Quality",    "Lossless" if audio_format == "flac" else f"{quality} kbps")
+        done_tbl.add_row("Tagged",     str(len(final_paths)))
+        if normalize:   done_tbl.add_row("Normalised", "Yes (-14 LUFS)")
+        if organize:    done_tbl.add_row("Organised",  "By Artist")
+        if playlist:    done_tbl.add_row("Playlist",   f"{playlist}.m3u")
+        if use_whisper: done_tbl.add_row("Whisper",    f"Model: {whisper_model}")
+        if cookie_cfg:  done_tbl.add_row("Cookies",    next(iter(cookie_cfg.values()))[0])
         console.print(done_tbl)
         console.print("\n[bold green]All done! Enjoy your music. 🎶[/bold green]\n")
 
@@ -576,7 +610,7 @@ def _wizard():
 def _cli():
     """Thin argparse wrapper so existing scripts keep working."""
     parser = argparse.ArgumentParser(
-        description="Spotify → Audio Downloader  (run without flags for interactive mode)",
+        description="Spotify → Audio Downloader  (run without flags for interactive wizard)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Tip: just run  python main.py  for the guided interactive wizard.\n\n"
@@ -637,8 +671,10 @@ def _cli():
     if args.dedupe:
         d = Path(args.dedupe)
         if not d.exists() or not d.is_dir():
-            console.print(f"[red]❌  '{d}' not found.[/red]"); sys.exit(1)
-        remove_duplicates(d); sys.exit(0)
+            console.print(f"[red]❌  '{d}' not found.[/red]")
+            sys.exit(1)
+        remove_duplicates(d)
+        sys.exit(0)
 
     # ── Manual-only ───────────────────────────────────────────────────────────
     if args.manual and not any([args.search, args.download, args.all, args.record]):
@@ -646,15 +682,15 @@ def _cli():
         console.print("[green]✓ Songs saved. Run --search --download when ready.[/green]")
         return
 
-    # ── Format selection ──────────────────────────────────────────────────────
+    # ── Format selection (if not supplied via flag) ───────────────────────────
     if (args.download or args.all) and not args.format:
         args.format = _ask_select(
             "Choose audio format",
             choices=[
                 {"name": "Opus (transparent, ~40-50% smaller than FLAC)", "value": "opus"},
-                {"name": "FLAC (lossless)", "value": "flac"},
-                {"name": "M4A / AAC",       "value": "m4a"},
-                {"name": "MP3",             "value": "mp3"},
+                {"name": "FLAC (lossless)",                               "value": "flac"},
+                {"name": "M4A / AAC",                                     "value": "m4a"},
+                {"name": "MP3",                                           "value": "mp3"},
             ],
             default="opus",
         )
@@ -671,15 +707,18 @@ def _cli():
     elif args.cookies_file:
         cf = Path(args.cookies_file)
         if not cf.exists():
-            console.print(f"[red]❌  Cookies file not found: {cf}[/red]"); sys.exit(1)
+            console.print(f"[red]❌  Cookies file not found: {cf}[/red]")
+            sys.exit(1)
         cookie_cfg["cookiefile"] = str(cf)
 
     # ── Manual entry ──────────────────────────────────────────────────────────
     if args.manual:
         _manual_entry(input_file, append=input_file.exists())
-    elif not args.no_prompt and not args.record and (args.download or args.all or args.search):
+    elif not args.no_prompt and not args.record and (
+        args.download or args.all or args.search
+    ):
         try:
-            if input("➜  Add songs manually before continuing? [y/N]: ").strip().lower() in ("y","yes"):
+            if input("➜  Add songs manually before continuing? [y/N]: ").strip().lower() in ("y", "yes"):
                 _manual_entry(input_file, append=input_file.exists())
         except (EOFError, KeyboardInterrupt):
             pass
@@ -697,9 +736,11 @@ def _cli():
 
     # ── Download + tag ────────────────────────────────────────────────────────
     if args.download or args.all:
-        if not check_ffmpeg(): sys.exit(1)
+        if not check_ffmpeg():
+            sys.exit(1)
         if not found_file.exists() or found_file.stat().st_size == 0:
-            console.print("[red]❌  No URLs found. Run --search first.[/red]"); sys.exit(1)
+            console.print("[red]❌  No URLs found. Run --search first.[/red]")
+            sys.exit(1)
 
         console.print("\n[bold cyan]━━━  Downloading[/bold cyan]")
         downloaded = download_songs(
@@ -718,9 +759,11 @@ def _cli():
                 from youtube import download_track
                 for ln in failed:
                     sn = ln.split("|")[0].strip()
-                    fp = download_track(ln, out_dir, format_ext=args.format,
-                                        quality=args.quality, normalize=normalize,
-                                        cookie_cfg=cookie_cfg)
+                    fp = download_track(
+                        ln, out_dir, format_ext=args.format,
+                        quality=args.quality, normalize=normalize,
+                        cookie_cfg=cookie_cfg,
+                    )
                     if fp:
                         downloaded.append((sn, fp))
                         console.print(f"  [green]✓ Retry OK:[/green] {sn}")
@@ -740,7 +783,8 @@ def _cli():
                 generate_m3u(args.playlist, out_dir, found_file, final_paths)
 
             t = Table(title="🎉 Done", header_style="bold magenta")
-            t.add_column("Task"); t.add_column("Result", justify="right", style="green")
+            t.add_column("Task")
+            t.add_column("Result", justify="right", style="green")
             t.add_row("Downloaded", str(len(downloaded)))
             t.add_row("Format",     args.format.upper())
             t.add_row("Tagged",     str(len(final_paths)))
@@ -755,8 +799,8 @@ def _cli():
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # If the user passed any flags → legacy CLI mode
-    # If they just typed  python main.py  → interactive wizard
+    # Flags present → legacy CLI mode
+    # No flags      → interactive wizard
     if len(sys.argv) > 1:
         _cli()
     else:
