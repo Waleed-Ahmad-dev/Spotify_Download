@@ -65,9 +65,11 @@ def _ask_select(message: str, choices: list, default: str = None) -> str:
     name, not the value, as the default).
     """
     if _HAS_Q:
-        # Build questionary Choice objects and resolve the default → name
-        q_choices = []
-        resolved_default = None          # will be set to the name string
+        # Build questionary Choice objects.
+        # default must be the *Choice object* itself — passing a string (even
+        # the title) causes questionary to raise ValueError on some versions.
+        q_choices       = []
+        default_choice  = None
 
         for c in choices:
             if isinstance(c, dict):
@@ -77,22 +79,23 @@ def _ask_select(message: str, choices: list, default: str = None) -> str:
                 name  = c
                 value = c
 
-            q_choices.append(Choice(title=name, value=value))
+            ch = Choice(title=name, value=value)
+            q_choices.append(ch)
 
-            # Match the caller-supplied default (which is a value) to the name
+            # Match caller-supplied default (a value string) → Choice object
             if default is not None and value == default:
-                resolved_default = name
+                default_choice = ch
 
         result = questionary.select(
             message,
             choices=q_choices,
-            default=resolved_default,   # questionary needs the *name*
+            default=default_choice,   # must be a Choice object, never a string
             style=_Q_STYLE,
         ).ask()
 
         if result is None:
             _abort()
-        return result          # questionary returns the *value* from Choice
+        return result   # questionary returns choice.value
 
     else:
         # Plain-text fallback — works without questionary installed
