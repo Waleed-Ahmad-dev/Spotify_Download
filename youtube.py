@@ -3,22 +3,30 @@
 youtube.py
 YouTube search + download engine.
 
-Strategy (v5)
+Strategy (v6)
 -------------
 Download and conversion are two completely separate steps:
 
   Step 1 – yt-dlp downloads the BEST AVAILABLE audio stream in whatever
             container the video offers (webm/m4a/ogg/mp4 – anything).
             No codec is specified, so "Requested format is not available"
-            can never occur.
+            can never occur under normal circumstances.
 
   Step 2 – ffmpeg converts the raw download to the user's chosen format
             (opus / flac / mp3 / m4a) and, optionally, normalises loudness.
 
-Key fix (v5): yt-dlp defaults ({}) now run FIRST because they have the
-widest format support.  Specific player_client overrides are fallbacks only.
-When a format error occurs the engine also cycles through a format-string
-ladder before giving up, so almost any publicly-available video succeeds.
+Key fixes (v6)
+--------------
+• A custom _QuietLogger suppresses yt-dlp's raw stderr spam entirely;
+  errors surface only through our own formatted messages.
+• When cookies are present, the 'web' player client runs FIRST — it is the
+  only client that can derive PO (Proof-of-Origin) tokens from browser
+  cookies, which YouTube requires in 2024-2025 for most clients.
+• 'mweb' and 'tv_embedded' follow; both are historically exempt from the
+  strictest PO-token checks.
+• yt-dlp defaults ({}) run next for maximum built-in compatibility.
+• A format-string ladder is tried per client before moving on.
+• A yt-dlp version warning fires if the installed version is too old.
 """
 
 import sys
@@ -26,6 +34,7 @@ import time
 import random
 import subprocess
 import concurrent.futures
+from datetime import date
 from pathlib import Path
 from typing import Dict, Any, List, Tuple, Optional
 
@@ -37,19 +46,57 @@ from rich.progress import (
 
 from utils import console, sanitize_filename
 
+# ── yt-dlp version guard ──────────────────────────────────────────────────────
+_MIN_YTDLP_DATE = date(2024, 11, 1)   # anything older is likely to break
+
+def _check_ytdlp_version() -> None:
+    """Warn if yt-dlp is older than _MIN_YTDLP_DATE."""
+    try:
+        ver = yt_dlp.version.__version__   # e.g. "2024.12.23"
+        parts = ver.split(".")
+        if len(parts) >= 3:
+            release = date(int(parts[0]), int(parts[1]), int(parts[2]))
+            if release < _MIN_YTDLP_DATE:
+                console.print(
+                    f"[bold yellow]⚠  yt-dlp {ver} is outdated.[/bold yellow] "
+                    "Many downloads will fail.\n"
+                    "   Run: [cyan]pip install -U yt-dlp[/cyan]\n"
+                )
+    except Exception:
+        pass
+
+_check_ytdlp_version()
+
+
+# ── Silent logger — suppresses yt-dlp's raw stderr ERROR: lines ──────────────
+class _QuietLogger:
+    """Redirect all yt-dlp log output to /dev/null."""
+    def debug(self, msg: str)   -> None: pass
+    def info(self, msg: str)    -> None: pass
+    def warning(self, msg: str) -> None: pass
+    def error(self, msg: str)   -> None: pass
+
+
 # ── Client strategies ─────────────────────────────────────────────────────────
-# IMPORTANT: {} (yt-dlp defaults) is FIRST — it has the widest format support.
-# Specific player_client overrides are kept as fallbacks, primarily for
-# age-restricted videos.  Moving {} to the end was the original bug.
-_DOWNLOAD_CLIENT_STRATEGIES: List[Dict[str, Any]] = [
-    {},                                                                          # yt-dlp defaults (best coverage)
-    {"player_client": ["ios"],                       "skip": ["translated_subs"]},
-    {"player_client": ["android_music"],             "skip": ["translated_subs"]},
-    {"player_client": ["android_music", "android"],  "skip": ["translated_subs"]},
-    {"player_client": ["tv_embedded"],               "skip": ["translated_subs"]},
-    {"player_client": ["mweb"],                      "skip": ["translated_subs"]},
+# Ordered by reliability in 2025 YouTube:
+#   1. web  — needs PO tokens, but derives them from browser cookies
+#   2. mweb — mobile web, often exempt from strictest PO-token checks
+#   3. tv_embedded — historically exempt from PO tokens
+#   4. {}   — yt-dlp auto-selects the best available client
+#   5-7.    — specific clients as last resorts
+_BASE_STRATEGIES: List[Dict[str, Any]] = [
+    {"player_client": ["mweb"],                          "skip": ["translated_subs"]},
+    {"player_client": ["tv_embedded"],                   "skip": ["translated_subs"]},
+    {},                                                                          # yt-dlp defaults
+    {"player_client": ["android_music"],                 "skip": ["translated_subs"]},
+    {"player_client": ["android_music", "android"],      "skip": ["translated_subs"]},
     {"player_client": ["android", "tv_embedded", "web"], "skip": ["translated_subs"]},
 ]
+
+# When cookies ARE present, prepend 'web' (PO tokens flow from cookie session)
+_WEB_STRATEGY: Dict[str, Any] = {
+    "player_client": ["web"], "skip": ["translated_subs"]
+}
 
 _SEARCH_EXTRACTOR_ARGS: Dict[str, Any] = {
     "youtube": {
@@ -58,14 +105,14 @@ _SEARCH_EXTRACTOR_ARGS: Dict[str, Any] = {
     }
 }
 
-# Format-string ladder — tried in order when a format error occurs.
-# Each string is more permissive than the previous one.
+# Format-string ladder — tried in order on format errors.
+# Each entry is progressively more permissive.
 _FORMAT_STRINGS: List[str] = [
     "bestaudio/best",
     "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio[ext=ogg]/bestaudio/best",
-    "ba[ext=webm]/ba[ext=m4a]/ba[ext=ogg]/ba/b",
+    "ba[ext=webm]/ba[ext=m4a]/ba/b",
     "bestvideo[acodec!=none]+bestaudio/bestvideo[acodec!=none]/best",
-    "best",                                                                      # absolute last resort
+    "best",
 ]
 
 # Raw audio extensions yt-dlp may produce before our ffmpeg pass
@@ -93,6 +140,14 @@ _FORMAT_ERRORS = frozenset([
     "no audio formats found",
 ])
 
+_UNAVAILABLE_ERRORS = frozenset([
+    "video unavailable",
+    "this video is not available",
+    "this video has been removed",
+    "copyright",
+    "blocked",
+])
+
 _RATE_LIMIT_ERRORS = frozenset([
     "429",
     "too many requests",
@@ -100,17 +155,10 @@ _RATE_LIMIT_ERRORS = frozenset([
 ])
 
 
-def _is_age_gate_error(msg: str) -> bool:
-    low = msg.lower()
-    return any(k in low for k in _AGE_GATE_ERRORS)
-
-def _is_format_error(msg: str) -> bool:
-    low = msg.lower()
-    return any(k in low for k in _FORMAT_ERRORS)
-
-def _is_rate_limit_error(msg: str) -> bool:
-    low = msg.lower()
-    return any(k in low for k in _RATE_LIMIT_ERRORS)
+def _is_age_gate_error(msg: str)    -> bool: return any(k in msg.lower() for k in _AGE_GATE_ERRORS)
+def _is_format_error(msg: str)      -> bool: return any(k in msg.lower() for k in _FORMAT_ERRORS)
+def _is_unavailable_error(msg: str) -> bool: return any(k in msg.lower() for k in _UNAVAILABLE_ERRORS)
+def _is_rate_limit_error(msg: str)  -> bool: return any(k in msg.lower() for k in _RATE_LIMIT_ERRORS)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -124,19 +172,15 @@ def _build_ydl_opts(
     pp_hook,
     fmt:          str = "bestaudio/best",
 ) -> Dict[str, Any]:
-    """
-    Build yt-dlp options for a raw audio download.
-    No postprocessor / codec is specified — we just want the audio bytes
-    in whatever container yt-dlp can grab.
-    """
+    """Build yt-dlp options for a raw audio download (no codec conversion)."""
     opts: Dict[str, Any] = {
         "format":      fmt,
         "outtmpl":     str(output_stem) + ".%(ext)s",
-        "quiet":       True,
-        "no_warnings": True,
+        # Use our silent logger instead of quiet/no_warnings flags so that
+        # yt-dlp never writes directly to stderr.
+        "logger":      _QuietLogger(),
         "noprogress":  True,
         "age_limit":   99,
-        # Keep the raw file; ffmpeg converts it in step 2
         "postprocessors":      [],
         "postprocessor_hooks": [pp_hook],
     }
@@ -147,10 +191,7 @@ def _build_ydl_opts(
 
 
 def _find_raw_download(output_folder: Path, safe_name: str) -> Optional[Path]:
-    """
-    Find whatever file yt-dlp actually wrote (any audio extension, any name
-    that starts with our safe_name prefix).
-    """
+    """Find whatever audio file yt-dlp actually wrote for this track."""
     prefix = safe_name[:50].lower()
     for f in output_folder.iterdir():
         if (
@@ -172,8 +213,9 @@ def _attempt_download(
     fmt:           str,
 ) -> Tuple[Optional[Path], Optional[str]]:
     """
-    Make one yt-dlp download attempt with given client args and format string.
-    Returns (path_or_None, error_str_or_None).
+    One yt-dlp download attempt.
+    Returns (path_or_None, error_message_or_None).
+    All yt-dlp output is silenced via _QuietLogger.
     """
     final_path: List[Optional[Path]] = [None]
 
@@ -192,9 +234,7 @@ def _attempt_download(
         if candidate and candidate.exists() and candidate.stat().st_size > 0:
             return candidate, None
         found = _find_raw_download(output_folder, safe_name)
-        if found:
-            return found, None
-        return None, "download completed but file not found"
+        return (found, None) if found else (None, "download completed but file not found")
 
     except yt_dlp.utils.DownloadError as exc:
         return None, str(exc)
@@ -209,33 +249,28 @@ def _raw_download(
     cookie_cfg:    Dict[str, Any],
 ) -> Optional[Path]:
     """
-    Try every (client_strategy × format_string) combination until yt-dlp
-    successfully downloads the raw audio stream.
-    Returns the Path of the downloaded file, or None.
+    Try every (client_strategy × format_string) combination.
+    Returns the Path of the raw downloaded file, or None.
 
-    The outer loop is client strategies; the inner loop is format strings.
-    On a *format* error we immediately try the next format string (same
-    client).  On an *age-gate* error we jump straight to the cookie+tv_embedded
-    emergency path.  On a *rate-limit* error we sleep and move to the next
-    client strategy.
+    Outer loop : client strategies
+    Inner loop : format strings (cycled on format errors only)
+
+    When cookies are present, the 'web' client is prepended — it's the only
+    client that can derive PO tokens from browser cookies (needed in 2025 YT).
     """
     safe_name   = sanitize_filename(song_name)
     output_stem = output_folder / safe_name
 
-    # If already downloaded (raw or final), skip straight away
     existing = _find_raw_download(output_folder, safe_name)
     if existing:
         return existing
 
-    strategies = list(_DOWNLOAD_CLIENT_STRATEGIES)
+    strategies = list(_BASE_STRATEGIES)
     if cookie_cfg:
-        # Prepend an extra tv_embedded+cookies attempt for age-gated videos
-        strategies = [
-            {"player_client": ["tv_embedded"], "skip": ["translated_subs"]},
-            *strategies,
-        ]
+        strategies = [_WEB_STRATEGY, *strategies]
 
     age_gate_emergency_used = False
+    last_error_global: Optional[str] = None
 
     for attempt_idx, client_args in enumerate(strategies):
         last_error: Optional[str] = None
@@ -249,27 +284,27 @@ def _raw_download(
             if path:
                 return path
 
-            last_error = err or last_error
+            last_error = err
+            last_error_global = err
 
             if err is None:
-                break  # succeeded at the path-finding step but still no file?
+                break
 
             if _is_format_error(err):
-                # Try the next, more-permissive format string
-                continue
+                continue          # try next, more-permissive format string
 
-            if _is_age_gate_error(err):
-                break  # format cycling won't help; handle below
+            break                 # non-format error: format cycling won't help
 
-            if _is_rate_limit_error(err):
-                break  # format cycling won't help; handle below
-
-            # Any other error: no point trying more formats
-            break
-
-        # ── Post-inner-loop: classify and act on the last error ───────────────
+        # ── Post-inner: classify and react ───────────────────────────────────
         if last_error is None:
-            continue  # no error recorded — file was found above
+            continue
+
+        if _is_unavailable_error(last_error):
+            console.print(
+                f"  [bold red]✗ Video unavailable:[/bold red] {song_name}\n"
+                "    It may be deleted, geo-blocked, or copyright-restricted."
+            )
+            return None           # no point trying more strategies
 
         if _is_age_gate_error(last_error):
             if cookie_cfg and not age_gate_emergency_used:
@@ -286,17 +321,11 @@ def _raw_download(
                     )
                     if path:
                         return path
-            else:
-                if attempt_idx == 0:
-                    console.print(
-                        f"  [red]✗ Age-restricted:[/red] {song_name}\n"
-                        "    [dim]To unlock: choose 'Use browser cookies' "
-                        "in the wizard.[/dim]"
-                    )
-            continue
-
-        if _is_format_error(last_error):
-            # All format strings exhausted for this client — try next client
+            elif attempt_idx == 0:
+                console.print(
+                    f"  [red]✗ Age-restricted:[/red] {song_name}\n"
+                    "    [dim]To unlock: choose 'Use browser cookies' in the wizard.[/dim]"
+                )
             continue
 
         if _is_rate_limit_error(last_error):
@@ -305,16 +334,22 @@ def _raw_download(
             time.sleep(wait)
             continue
 
-        # Unknown error: log on the last strategy only
-        if attempt_idx == len(strategies) - 1:
-            console.print(
-                f"  [bold red]✗ Download failed for '{song_name}':[/bold red] {last_error}"
-            )
+        if _is_format_error(last_error):
+            continue   # all format strings exhausted; try next client
 
-    console.print(
-        f"  [bold red]✗ All strategies exhausted for '{song_name}'.[/bold red] "
-        "The video may be geo-blocked or unavailable in your region."
-    )
+    # All strategies failed
+    if last_error_global and _is_format_error(last_error_global):
+        console.print(
+            f"  [bold red]✗ All download strategies failed for '{song_name}'.[/bold red]\n"
+            "  Possible causes:\n"
+            "    • [yellow]Outdated yt-dlp[/yellow] — run: [cyan]pip install -U yt-dlp[/cyan]\n"
+            "    • Video is geo-blocked in your region\n"
+            "    • YouTube is temporarily rate-limiting your IP"
+        )
+    elif last_error_global:
+        console.print(
+            f"  [bold red]✗ Download failed for '{song_name}':[/bold red] {last_error_global}"
+        )
     return None
 
 
@@ -322,7 +357,6 @@ def _raw_download(
 # Step 2 helper – ffmpeg conversion
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ffmpeg codec names for each output format
 _CODEC_MAP = {
     "opus": "libopus",
     "mp3":  "libmp3lame",
@@ -330,7 +364,6 @@ _CODEC_MAP = {
     "m4a":  "aac",
 }
 
-# Container format passed to ffmpeg -f (for formats where ext ≠ container name)
 _CONTAINER_MAP = {
     "m4a": "mp4",
 }
@@ -343,45 +376,25 @@ def _convert_to_format(
     quality:    str,
     normalize:  bool,
 ) -> bool:
-    """
-    Convert *raw_file* → *out_path* using ffmpeg.
-
-    For Opus: VBR with the user-chosen bitrate target.
-    For MP3 / M4A: CBR at the chosen bitrate.
-    For FLAC: lossless, no bitrate needed.
-    Normalisation (loudnorm) is applied as an audio filter when requested.
-    Returns True on success.
-    """
+    """Convert raw_file → out_path via ffmpeg. Returns True on success."""
     codec = _CODEC_MAP.get(format_ext, format_ext)
 
-    # Build audio filter chain
     filters: list[str] = []
     if normalize:
         filters.append("loudnorm=I=-14:LRA=11:TP=-1.0")
 
-    cmd: list[str] = ["ffmpeg", "-y", "-i", str(raw_file)]
+    cmd: list[str] = ["ffmpeg", "-y", "-i", str(raw_file), "-c:a", codec]
 
-    # Audio codec
-    cmd += ["-c:a", codec]
-
-    # Bitrate / quality flags (not needed for lossless FLAC)
     if format_ext == "opus":
         cmd += ["-b:a", f"{quality}k", "-vbr", "on", "-compression_level", "10"]
     elif format_ext in ("mp3", "m4a"):
         cmd += ["-b:a", f"{quality}k"]
-    # flac: no bitrate flag needed
 
-    # Audio filter
     if filters:
         cmd += ["-af", ",".join(filters)]
 
-    # Drop video / cover art streams (avoids container mismatch errors)
-    cmd += ["-vn"]
+    cmd += ["-vn", "-map_metadata", "0"]
 
-    # Copy all metadata tags
-    cmd += ["-map_metadata", "0"]
-
-    # Output container (some formats need explicit -f)
     container = _CONTAINER_MAP.get(format_ext)
     if container:
         cmd += ["-f", container]
@@ -405,11 +418,8 @@ def download_track(
     cookie_cfg:    Dict[str, Any] = None,
 ) -> Optional[Path]:
     """
-    Download one track from a ``song_name | url`` line and convert it to
-    the requested format.
-
-    Returns the Path of the final audio file on success, None on failure.
-    Exported so main.py can use it in the outer retry loop.
+    Download one track from a 'song_name | url' line and convert it.
+    Returns the final audio Path on success, None on failure.
     """
     if cookie_cfg is None:
         cookie_cfg = {}
@@ -420,26 +430,20 @@ def download_track(
     safe_name      = sanitize_filename(song_name)
     final_path     = output_folder / f"{safe_name}.{format_ext}"
 
-    # Already fully converted — nothing to do
     if final_path.exists() and final_path.stat().st_size > 0:
         return final_path
 
-    # ── Step 1: download raw audio ────────────────────────────────────────────
     raw_file = _raw_download(url, song_name, output_folder, cookie_cfg)
     if raw_file is None:
         return None
 
-    # If yt-dlp already produced the exact format we want (e.g. it fetched an
-    # .opus stream and we want opus), just rename it and skip ffmpeg.
+    # If yt-dlp already produced the exact target format, just rename
     if raw_file.suffix.lower().lstrip(".") == format_ext and not normalize:
         raw_file.rename(final_path)
         return final_path
 
-    # ── Step 2: ffmpeg conversion ─────────────────────────────────────────────
     ok = _convert_to_format(raw_file, final_path, format_ext, quality, normalize)
-
     if ok:
-        # Remove the raw intermediate file now that conversion succeeded
         try:
             if raw_file != final_path:
                 raw_file.unlink()
@@ -447,10 +451,7 @@ def download_track(
             pass
         return final_path
     else:
-        console.print(
-            f"  [bold red]✗ ffmpeg conversion failed for '{song_name}'[/bold red]"
-        )
-        # Keep the raw file so the user still has something
+        console.print(f"  [bold red]✗ ffmpeg conversion failed for '{song_name}'[/bold red]")
         return None
 
 
@@ -467,8 +468,8 @@ def find_url(song_name: str) -> Dict[str, Any]:
     ]
     opts = {
         "extract_flat": True,
-        "quiet":        True,
-        "no_warnings":  True,
+        "logger":       _QuietLogger(),
+        "noprogress":   True,
         "noplaylist":   True,
         "age_limit":    99,
         "extractor_args": _SEARCH_EXTRACTOR_ARGS,
@@ -493,8 +494,7 @@ def find_url(song_name: str) -> Dict[str, Any]:
                         return {"song": song_name, "url": url, "found": True}
                 break
             except Exception as exc:
-                err = str(exc)
-                if _is_rate_limit_error(err):
+                if _is_rate_limit_error(str(exc)):
                     time.sleep(random.uniform(10, 20))
                     break
                 if attempt == 1:
@@ -509,7 +509,7 @@ def search_youtube(
     output_notfound: Path,
     max_workers:     int = 3,
 ) -> None:
-    """Search YouTube for every song in *input_file* using a thread pool."""
+    """Search YouTube for every song in input_file using a thread pool."""
     if not input_file.exists():
         console.print(f"[bold red]❌ Error: '{input_file}' not found.[/bold red]")
         sys.exit(1)
@@ -570,7 +570,7 @@ def download_songs(
     normalize:     bool           = False,
     cookie_cfg:    Dict[str, Any] = None,
 ) -> List[Tuple[str, Path]]:
-    """Download and convert all songs listed in *input_file* in parallel."""
+    """Download and convert all songs listed in input_file in parallel."""
     if cookie_cfg is None:
         cookie_cfg = {}
     if not input_file.exists():
@@ -583,9 +583,9 @@ def download_songs(
 
     console.print()
     hints = []
-    if normalize:    hints.append("loudnorm -14 LUFS")
-    if format_ext == "opus": hints.append("Opus VBR — transparent, ~40-50% smaller than FLAC")
-    if cookie_cfg:   hints.append("browser cookies active")
+    if normalize:              hints.append("loudnorm -14 LUFS")
+    if format_ext == "opus":   hints.append("Opus VBR — transparent, ~40-50% smaller than FLAC")
+    if cookie_cfg:             hints.append("browser cookies active")
     for h in hints:
         console.print(f"[dim italic]↳ {h}[/dim italic]")
 
