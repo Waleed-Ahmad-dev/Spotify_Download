@@ -3,9 +3,9 @@
 youtube.py
 YouTube search + download engine.
 
-Strategy (v4)
+Strategy (v5)
 -------------
-Download and conversion are now two completely separate steps:
+Download and conversion are two completely separate steps:
 
   Step 1 – yt-dlp downloads the BEST AVAILABLE audio stream in whatever
             container the video offers (webm/m4a/ogg/mp4 – anything).
@@ -15,8 +15,10 @@ Download and conversion are now two completely separate steps:
   Step 2 – ffmpeg converts the raw download to the user's chosen format
             (opus / flac / mp3 / m4a) and, optionally, normalises loudness.
 
-This makes every track downloadable regardless of which audio streams
-YouTube exposes for a particular video or client.
+Key fix (v5): yt-dlp defaults ({}) now run FIRST because they have the
+widest format support.  Specific player_client overrides are fallbacks only.
+When a format error occurs the engine also cycles through a format-string
+ladder before giving up, so almost any publicly-available video succeeds.
 """
 
 import sys
@@ -36,14 +38,17 @@ from rich.progress import (
 from utils import console, sanitize_filename
 
 # ── Client strategies ─────────────────────────────────────────────────────────
-# tv_embedded first: most effective bypass for age-restricted videos.
+# IMPORTANT: {} (yt-dlp defaults) is FIRST — it has the widest format support.
+# Specific player_client overrides are kept as fallbacks, primarily for
+# age-restricted videos.  Moving {} to the end was the original bug.
 _DOWNLOAD_CLIENT_STRATEGIES: List[Dict[str, Any]] = [
-    {"player_client": ["tv_embedded"],                   "skip": ["translated_subs"]},
-    {"player_client": ["android_music"],                 "skip": ["translated_subs"]},
-    {"player_client": ["android_music", "android"],      "skip": ["translated_subs"]},
-    {"player_client": ["mweb"],                          "skip": ["translated_subs"]},
+    {},                                                                          # yt-dlp defaults (best coverage)
+    {"player_client": ["ios"],                       "skip": ["translated_subs"]},
+    {"player_client": ["android_music"],             "skip": ["translated_subs"]},
+    {"player_client": ["android_music", "android"],  "skip": ["translated_subs"]},
+    {"player_client": ["tv_embedded"],               "skip": ["translated_subs"]},
+    {"player_client": ["mweb"],                      "skip": ["translated_subs"]},
     {"player_client": ["android", "tv_embedded", "web"], "skip": ["translated_subs"]},
-    {},   # yt-dlp built-in defaults — absolute last resort
 ]
 
 _SEARCH_EXTRACTOR_ARGS: Dict[str, Any] = {
@@ -53,12 +58,18 @@ _SEARCH_EXTRACTOR_ARGS: Dict[str, Any] = {
     }
 }
 
-# Download any audio stream — NO codec preference here.
-# We convert with ffmpeg afterwards, so the container doesn't matter.
-_FORMAT = "bestaudio/best"
+# Format-string ladder — tried in order when a format error occurs.
+# Each string is more permissive than the previous one.
+_FORMAT_STRINGS: List[str] = [
+    "bestaudio/best",
+    "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio[ext=ogg]/bestaudio/best",
+    "ba[ext=webm]/ba[ext=m4a]/ba[ext=ogg]/ba/b",
+    "bestvideo[acodec!=none]+bestaudio/bestvideo[acodec!=none]/best",
+    "best",                                                                      # absolute last resort
+]
 
 # Raw audio extensions yt-dlp may produce before our ffmpeg pass
-_RAW_AUDIO_EXTS = {".webm", ".m4a", ".ogg", ".opus", ".mp3", ".flac", ".wav", ".aac"}
+_RAW_AUDIO_EXTS = {".webm", ".m4a", ".ogg", ".opus", ".mp3", ".flac", ".wav", ".aac", ".mp4"}
 
 # ── Error classification ──────────────────────────────────────────────────────
 _AGE_GATE_ERRORS = frozenset([
@@ -79,6 +90,7 @@ _FORMAT_ERRORS = frozenset([
     "format is not available",
     "no video formats found",
     "requested format is not available",
+    "no audio formats found",
 ])
 
 _RATE_LIMIT_ERRORS = frozenset([
@@ -106,10 +118,11 @@ def _is_rate_limit_error(msg: str) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _build_ydl_opts(
-    output_stem: Path,
-    client_args: Dict[str, Any],
-    cookie_cfg:  Dict[str, Any],
+    output_stem:  Path,
+    client_args:  Dict[str, Any],
+    cookie_cfg:   Dict[str, Any],
     pp_hook,
+    fmt:          str = "bestaudio/best",
 ) -> Dict[str, Any]:
     """
     Build yt-dlp options for a raw audio download.
@@ -117,7 +130,7 @@ def _build_ydl_opts(
     in whatever container yt-dlp can grab.
     """
     opts: Dict[str, Any] = {
-        "format":      _FORMAT,
+        "format":      fmt,
         "outtmpl":     str(output_stem) + ".%(ext)s",
         "quiet":       True,
         "no_warnings": True,
@@ -149,6 +162,46 @@ def _find_raw_download(output_folder: Path, safe_name: str) -> Optional[Path]:
     return None
 
 
+def _attempt_download(
+    url:           str,
+    output_stem:   Path,
+    output_folder: Path,
+    safe_name:     str,
+    client_args:   Dict[str, Any],
+    cookie_cfg:    Dict[str, Any],
+    fmt:           str,
+) -> Tuple[Optional[Path], Optional[str]]:
+    """
+    Make one yt-dlp download attempt with given client args and format string.
+    Returns (path_or_None, error_str_or_None).
+    """
+    final_path: List[Optional[Path]] = [None]
+
+    def _pp_hook(d: Dict[str, Any]) -> None:
+        if d.get("status") == "finished":
+            fp = d.get("filepath") or (d.get("info_dict") or {}).get("filepath")
+            if fp:
+                final_path[0] = Path(fp)
+
+    opts = _build_ydl_opts(output_stem, client_args, cookie_cfg, _pp_hook, fmt)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+
+        candidate = final_path[0]
+        if candidate and candidate.exists() and candidate.stat().st_size > 0:
+            return candidate, None
+        found = _find_raw_download(output_folder, safe_name)
+        if found:
+            return found, None
+        return None, "download completed but file not found"
+
+    except yt_dlp.utils.DownloadError as exc:
+        return None, str(exc)
+    except Exception as exc:
+        return None, str(exc)
+
+
 def _raw_download(
     url:           str,
     song_name:     str,
@@ -156,8 +209,15 @@ def _raw_download(
     cookie_cfg:    Dict[str, Any],
 ) -> Optional[Path]:
     """
-    Try every client strategy in order until yt-dlp successfully downloads
-    the raw audio stream.  Returns the Path of the downloaded file or None.
+    Try every (client_strategy × format_string) combination until yt-dlp
+    successfully downloads the raw audio stream.
+    Returns the Path of the downloaded file, or None.
+
+    The outer loop is client strategies; the inner loop is format strings.
+    On a *format* error we immediately try the next format string (same
+    client).  On an *age-gate* error we jump straight to the cookie+tv_embedded
+    emergency path.  On a *rate-limit* error we sleep and move to the next
+    client strategy.
     """
     safe_name   = sanitize_filename(song_name)
     output_stem = output_folder / safe_name
@@ -169,7 +229,7 @@ def _raw_download(
 
     strategies = list(_DOWNLOAD_CLIENT_STRATEGIES)
     if cookie_cfg:
-        # Put cookies+tv_embedded first for best age-gate chance
+        # Prepend an extra tv_embedded+cookies attempt for age-gated videos
         strategies = [
             {"player_client": ["tv_embedded"], "skip": ["translated_subs"]},
             *strategies,
@@ -178,84 +238,83 @@ def _raw_download(
     age_gate_emergency_used = False
 
     for attempt_idx, client_args in enumerate(strategies):
-        final_path: List[Optional[Path]] = [None]
+        last_error: Optional[str] = None
 
-        def _pp_hook(d: Dict[str, Any]) -> None:
-            if d.get("status") == "finished":
-                fp = d.get("filepath") or (d.get("info_dict") or {}).get("filepath")
-                if fp:
-                    final_path[0] = Path(fp)
+        # ── Inner loop: format-string fallbacks ───────────────────────────────
+        for fmt in _FORMAT_STRINGS:
+            path, err = _attempt_download(
+                url, output_stem, output_folder,
+                safe_name, client_args, cookie_cfg, fmt,
+            )
+            if path:
+                return path
 
-        opts = _build_ydl_opts(output_stem, client_args, cookie_cfg, _pp_hook)
+            last_error = err or last_error
 
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url])
-
-            # Prefer hook-captured path, then folder scan
-            candidate = final_path[0]
-            if candidate and candidate.exists() and candidate.stat().st_size > 0:
-                return candidate
-            found = _find_raw_download(output_folder, safe_name)
-            if found:
-                return found
-
-        except yt_dlp.utils.DownloadError as exc:
-            err = str(exc)
-
-            if _is_age_gate_error(err):
-                if cookie_cfg and not age_gate_emergency_used:
-                    age_gate_emergency_used = True
-                    console.print(
-                        f"  [yellow]⚠ Age-restricted:[/yellow] {song_name} — "
-                        "retrying with cookies + tv_embedded…"
-                    )
-                    emergency_opts = _build_ydl_opts(
-                        output_stem,
-                        {"player_client": ["tv_embedded"], "skip": ["translated_subs"]},
-                        cookie_cfg,
-                        _pp_hook,
-                    )
-                    try:
-                        with yt_dlp.YoutubeDL(emergency_opts) as ydl:
-                            ydl.download([url])
-                        fp = final_path[0]
-                        if fp and fp.exists() and fp.stat().st_size > 0:
-                            return fp
-                        found = _find_raw_download(output_folder, safe_name)
-                        if found:
-                            return found
-                    except Exception:
-                        pass
-                else:
-                    if attempt_idx == 0:
-                        console.print(
-                            f"  [red]✗ Age-restricted:[/red] {song_name}\n"
-                            "    [dim]To unlock: choose 'Use browser cookies' "
-                            "in the wizard.[/dim]"
-                        )
-                continue
+            if err is None:
+                break  # succeeded at the path-finding step but still no file?
 
             if _is_format_error(err):
-                continue   # try next client strategy
-
-            if _is_rate_limit_error(err):
-                wait = random.uniform(8, 15)
-                console.print(f"  [yellow]⚠ Rate-limited[/yellow] — waiting {wait:.0f}s…")
-                time.sleep(wait)
+                # Try the next, more-permissive format string
                 continue
 
-            if attempt_idx == len(strategies) - 1:
-                console.print(
-                    f"  [bold red]✗ Download failed for '{song_name}':[/bold red] {exc}"
-                )
+            if _is_age_gate_error(err):
+                break  # format cycling won't help; handle below
 
-        except Exception as exc:
-            if attempt_idx == len(strategies) - 1:
-                console.print(
-                    f"  [bold red]✗ Unexpected error for '{song_name}':[/bold red] {exc}"
-                )
+            if _is_rate_limit_error(err):
+                break  # format cycling won't help; handle below
 
+            # Any other error: no point trying more formats
+            break
+
+        # ── Post-inner-loop: classify and act on the last error ───────────────
+        if last_error is None:
+            continue  # no error recorded — file was found above
+
+        if _is_age_gate_error(last_error):
+            if cookie_cfg and not age_gate_emergency_used:
+                age_gate_emergency_used = True
+                console.print(
+                    f"  [yellow]⚠ Age-restricted:[/yellow] {song_name} — "
+                    "retrying with cookies + tv_embedded…"
+                )
+                for fmt in _FORMAT_STRINGS:
+                    path, _ = _attempt_download(
+                        url, output_stem, output_folder, safe_name,
+                        {"player_client": ["tv_embedded"], "skip": ["translated_subs"]},
+                        cookie_cfg, fmt,
+                    )
+                    if path:
+                        return path
+            else:
+                if attempt_idx == 0:
+                    console.print(
+                        f"  [red]✗ Age-restricted:[/red] {song_name}\n"
+                        "    [dim]To unlock: choose 'Use browser cookies' "
+                        "in the wizard.[/dim]"
+                    )
+            continue
+
+        if _is_format_error(last_error):
+            # All format strings exhausted for this client — try next client
+            continue
+
+        if _is_rate_limit_error(last_error):
+            wait = random.uniform(8, 15)
+            console.print(f"  [yellow]⚠ Rate-limited[/yellow] — waiting {wait:.0f}s…")
+            time.sleep(wait)
+            continue
+
+        # Unknown error: log on the last strategy only
+        if attempt_idx == len(strategies) - 1:
+            console.print(
+                f"  [bold red]✗ Download failed for '{song_name}':[/bold red] {last_error}"
+            )
+
+    console.print(
+        f"  [bold red]✗ All strategies exhausted for '{song_name}'.[/bold red] "
+        "The video may be geo-blocked or unavailable in your region."
+    )
     return None
 
 
