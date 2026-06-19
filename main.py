@@ -196,7 +196,7 @@ def _manual_entry(output_file: Path, append: bool = False) -> int:
     existing = 0
     if mode == "a" and output_file.exists():
         existing = sum(
-            1 for ln in output_file.read_text(encoding="utf-8").splitlines()
+            1 for ln in output_file.read_text(encoding="utf-8-sig").splitlines()
             if ln.strip()
         )
 
@@ -552,7 +552,7 @@ def _wizard():
         # Outer retry for tracks that failed every internal strategy
         if downloaded is not None:
             done_names = {n for n, _ in downloaded}
-            with open(found_file, encoding="utf-8") as fh:
+            with open(found_file, encoding="utf-8-sig") as fh:
                 all_lines = [ln.strip() for ln in fh if ln.strip() and "|" in ln]
             failed_lines = [
                 ln for ln in all_lines
@@ -766,7 +766,7 @@ def _cli():
 
         if downloaded is not None:
             done_names = {n for n, _ in downloaded}
-            with open(found_file, encoding="utf-8") as fh:
+            with open(found_file, encoding="utf-8-sig") as fh:
                 all_lines = [ln.strip() for ln in fh if ln.strip() and "|" in ln]
             failed = [ln for ln in all_lines if ln.split("|")[0].strip() not in done_names]
             if failed:
