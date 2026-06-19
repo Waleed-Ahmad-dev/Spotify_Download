@@ -1,27 +1,25 @@
-anyio==4.12.1
-beautifulsoup4==4.14.3
-certifi==2026.1.4
-charset-normalizer==3.4.4
-h11==0.16.0
-httpcore==1.0.9
-httpx==0.28.1
-idna==3.11
-markdown-it-py==4.0.0
-mdurl==0.1.2
-mutagen==1.47.0
-prompt_toolkit==3.0.52
-Pygments==2.20.0
-questionary==2.1.1
-redis==7.1.1
-requests==2.32.5
-rich==15.0.0
-soupsieve==2.8.3
-spotipy==2.25.2
-typing_extensions==4.15.0
-urllib3==2.6.3
-wcwidth==0.6.0
-youtube-search-python==1.6.6
-yt-dlp==2026.2.4
-lyricsgenius>=3.0.1
-indic-transliteration>=2.3.37
-openai-whisper>=20231117
+# ── Core (required) ───────────────────────────────────────────────────────────
+# These four pull everything else in transitively (rich → markdown-it-py /
+# Pygments, questionary → prompt_toolkit / wcwidth, etc.).
+mutagen>=1.47.0          # audio tagging: ID3 / FLAC / MP4 / Opus
+rich>=13.7               # terminal UI (panels, tables, progress bars)
+questionary>=2.0         # interactive wizard menus
+yt-dlp>=2024.11.1        # YouTube search + audio download (keep this fresh!)
+
+# ── Windows only: capture the local Spotify app's "now playing" via GSMTC ─────
+# Modern PyWinRT split packages — they ship per-Python wheels and pull in
+# winrt-runtime automatically. No Spotify account or Web API is involved.
+# (On older setups the legacy monolithic `winsdk` package also works; the code
+#  imports whichever is present.)
+winrt-Windows.Media.Control ; sys_platform == "win32"
+winrt-Windows.Foundation ; sys_platform == "win32"
+winrt-Windows.Foundation.Collections ; sys_platform == "win32"
+
+# FFmpeg is also required (audio conversion + loudness normalisation) but is an
+# external program, not a pip package:
+#   Windows : winget install Gyan.FFmpeg   (or: pip install imageio-ffmpeg)
+#   Linux   : sudo apt install ffmpeg
+#   macOS   : brew install ffmpeg
+#
+# Optional extras (Whisper lyrics, Genius, better Hinglish) live in
+# requirements-optional.txt.
