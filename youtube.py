@@ -514,7 +514,7 @@ def search_youtube(
         console.print(f"[bold red]❌ Error: '{input_file}' not found.[/bold red]")
         sys.exit(1)
 
-    with open(input_file, "r", encoding="utf-8") as fh:
+    with open(input_file, "r", encoding="utf-8-sig") as fh:
         songs = [line.strip() for line in fh if line.strip()]
 
     found_list:     List[str] = []
@@ -578,7 +578,7 @@ def download_songs(
 
     output_folder.mkdir(parents=True, exist_ok=True)
 
-    with open(input_file, "r", encoding="utf-8") as fh:
+    with open(input_file, "r", encoding="utf-8-sig") as fh:
         lines = [ln.strip() for ln in fh if ln.strip()]
 
     console.print()
