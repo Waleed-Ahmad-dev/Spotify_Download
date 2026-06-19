@@ -67,11 +67,24 @@ def _win_run(coro):
     return _WIN_LOOP.run_until_complete(coro)
 
 
+def _media_manager_cls():
+    """Import the GSMTC session-manager class from whichever WinRT binding is
+    installed: the modern per-namespace `winrt-*` packages (preferred; ship
+    wheels for current Pythons) or the older monolithic `winsdk`."""
+    try:
+        from winrt.windows.media.control import (
+            GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+        )
+    except ImportError:
+        from winsdk.windows.media.control import (
+            GlobalSystemMediaTransportControlsSessionManager as MediaManager,
+        )
+    return MediaManager
+
+
 async def _win_spotify_session():
     """Return the Spotify GSMTC session (preferred), else the current session."""
-    from winsdk.windows.media.control import (
-        GlobalSystemMediaTransportControlsSessionManager as MediaManager,
-    )
+    MediaManager = _media_manager_cls()
     mgr = await MediaManager.request_async()
     for s in mgr.get_sessions():
         aumid = (s.source_app_user_model_id or "").lower()
