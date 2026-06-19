@@ -10,9 +10,10 @@ Updated: added .opus support throughout remove_duplicates().
 import os
 import sys
 import re
+import shutil
 import subprocess
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Optional
 
 from mutagen.mp3  import MP3
 from mutagen.id3  import ID3
@@ -25,50 +26,189 @@ from rich.panel   import Panel
 console = Console()
 
 IS_LINUX = sys.platform.startswith("linux")
+IS_WINDOWS = sys.platform.startswith("win")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ffmpeg / ffprobe discovery (cross-platform)
+# ─────────────────────────────────────────────────────────────────────────────
+# On Windows ffmpeg is rarely on PATH out of the box, and a frozen .exe ships its
+# own binaries.  These resolvers locate ffmpeg/ffprobe in this order:
+#   1. FFMPEG_LOCATION env override (a directory, or a direct file path)
+#   2. PATH (shutil.which)
+#   3. a bundled  vendor/  directory beside the script / frozen exe
+#   4. (ffmpeg only) the static binary shipped by the optional imageio-ffmpeg pkg
+
+def _exe_name(base: str) -> str:
+    """Append '.exe' on Windows."""
+    return base + ".exe" if IS_WINDOWS else base
+
+
+def _vendor_dirs() -> List[Path]:
+    """Candidate directories that may hold bundled ffmpeg/ffprobe binaries."""
+    dirs: List[Path] = []
+    if getattr(sys, "frozen", False):                       # PyInstaller build
+        dirs.append(Path(sys.executable).resolve().parent / "vendor")
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            dirs.append(Path(meipass) / "vendor")
+    dirs.append(Path(__file__).resolve().parent / "vendor")  # source checkout
+    return dirs
+
+
+def _resolve_binary(base: str, use_imageio: bool = False) -> Optional[str]:
+    """Resolve an ffmpeg/ffprobe path, or None if nothing is found."""
+    exe = _exe_name(base)
+
+    # 1. Explicit override (directory or full file path)
+    override = os.environ.get("FFMPEG_LOCATION", "").strip()
+    if override:
+        p = Path(override)
+        if p.is_file():
+            cand = p if p.stem.lower() == base else p.with_name(exe)
+            if cand.exists():
+                return str(cand)
+        elif p.is_dir() and (p / exe).exists():
+            return str(p / exe)
+
+    # 2. On PATH
+    found = shutil.which(base)
+    if found:
+        return found
+
+    # 3. Bundled vendor dir (frozen .exe or a manual drop-in beside the source)
+    for d in _vendor_dirs():
+        cand = d / exe
+        if cand.exists():
+            return str(cand)
+
+    # 4. imageio-ffmpeg static binary (ffmpeg only — it does not ship ffprobe)
+    if use_imageio:
+        try:
+            import imageio_ffmpeg
+            return imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+
+    return None
+
+
+_FFMPEG_PATH: Optional[str] = None
+_FFPROBE_PATH: Optional[str] = None
+
+
+def get_ffmpeg() -> str:
+    """Absolute path to ffmpeg, or the bare name 'ffmpeg' if unresolved."""
+    global _FFMPEG_PATH
+    if _FFMPEG_PATH is None:
+        _FFMPEG_PATH = _resolve_binary("ffmpeg", use_imageio=True) or "ffmpeg"
+    return _FFMPEG_PATH
+
+
+def get_ffprobe() -> str:
+    """Absolute path to ffprobe, or the bare name 'ffprobe' if unresolved."""
+    global _FFPROBE_PATH
+    if _FFPROBE_PATH is None:
+        _FFPROBE_PATH = _resolve_binary("ffprobe", use_imageio=False) or "ffprobe"
+    return _FFPROBE_PATH
+
+
+def _prepend_ffmpeg_to_path() -> None:
+    """
+    Put the resolved ffmpeg directory on PATH so child libraries that invoke
+    ffmpeg by name (yt-dlp post-processing, openai-whisper) can find it too.
+    """
+    ff = get_ffmpeg()
+    if os.sep in ff or "/" in ff:           # a real path, not a bare name
+        ff_dir = str(Path(ff).resolve().parent)
+        if ff_dir and ff_dir not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = ff_dir + os.pathsep + os.environ.get("PATH", "")
+
+
+_prepend_ffmpeg_to_path()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Filename sanitisation
+# ─────────────────────────────────────────────────────────────────────────────
+# Windows reserved device names — illegal as a file's base name (with or without
+# an extension), e.g. "NUL.mp3" cannot be created on Windows.
+_WIN_RESERVED = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
 
 
 def sanitize_filename(name: str, max_length: int = 150) -> str:
-    """Remove characters that are illegal in filenames and normalise whitespace."""
+    """Strip filename-illegal characters, normalise whitespace, and avoid the
+    Windows reserved device names."""
     name = re.sub(r'[\\/*?:"<>|]', "", name)
     name = re.sub(r"\s+", " ", name)
-    return name[:max_length].strip(". ")
+    name = name[:max_length].strip(". ")
+    if name.split(".", 1)[0].strip().lower() in _WIN_RESERVED:
+        name = "_" + name
+    return name or "untitled"
 
 
 def check_ffmpeg() -> bool:
-    """Return True if ffmpeg is available on PATH."""
+    """Return True if ffmpeg can be located (PATH, override, vendor/, or imageio)."""
+    ffmpeg = get_ffmpeg()
     try:
         subprocess.run(
-            ["ffmpeg", "-version"], capture_output=True, check=True, timeout=5
+            [ffmpeg, "-version"], capture_output=True, check=True, timeout=10
         )
         return True
-    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+    except (subprocess.CalledProcessError, FileNotFoundError,
+            subprocess.TimeoutExpired, OSError):
         console.print(
             "[bold red]❌ FFmpeg is required but not found.[/bold red]\n"
             "Install it:\n"
+            "   [cyan]Windows:[/cyan] winget install Gyan.FFmpeg   "
+            "[dim](or: pip install imageio-ffmpeg)[/dim]\n"
             "   [cyan]Linux:[/cyan]   sudo apt install ffmpeg\n"
             "   [cyan]macOS:[/cyan]   brew install ffmpeg\n"
-            "   [cyan]Windows:[/cyan] https://www.gyan.dev/ffmpeg/builds/"
+            "   [dim]Manual builds: https://www.gyan.dev/ffmpeg/builds/[/dim]"
         )
         return False
 
 
-def check_linux_requirements() -> bool:
-    """Return True if playerctl is available (Linux recorder requirement)."""
-    if not IS_LINUX:
-        console.print(
-            "[bold yellow]⚠️  WARNING:[/bold yellow] "
-            "Spotify recording requires Linux with playerctl."
-        )
-        return False
-    try:
-        subprocess.run(["which", "playerctl"], capture_output=True, check=True)
-        return True
-    except subprocess.CalledProcessError:
+def check_recorder_requirements() -> bool:
+    """
+    Return True if this platform's 'now-playing' recorder backend is available.
+      • Linux   → playerctl on PATH (reads the MPRIS/D-Bus interface)
+      • Windows → the 'winsdk' package (reads GSMTC — the system media session)
+    Reading the local Spotify app needs no Spotify account/API on either OS.
+    """
+    if IS_LINUX:
+        if shutil.which("playerctl"):
+            return True
         console.print(
             "[bold yellow]⚠️  WARNING:[/bold yellow] "
             "'playerctl' not found.  Install it: sudo apt install playerctl"
         )
         return False
+    if IS_WINDOWS:
+        try:
+            import winsdk.windows.media.control  # noqa: F401
+            return True
+        except Exception:
+            console.print(
+                "[bold yellow]⚠️  WARNING:[/bold yellow] "
+                "Windows recording needs the 'winsdk' package.\n"
+                "   Install it:  [cyan]pip install winsdk[/cyan]"
+            )
+            return False
+    console.print(
+        "[bold yellow]⚠️  WARNING:[/bold yellow] "
+        "Auto-recording from the Spotify app isn't supported on this platform.\n"
+        "   Use manual song entry or provide a songs.txt instead."
+    )
+    return False
+
+
+# Backwards-compatible alias for older imports / scripts.
+check_linux_requirements = check_recorder_requirements
 
 
 def generate_m3u(
@@ -108,9 +248,9 @@ def generate_m3u(
         if found_path and found_path.exists():
             try:
                 rel_path = found_path.relative_to(output_dir)
-                playlist_entries.append(str(rel_path))
+                playlist_entries.append(rel_path.as_posix())
             except ValueError:
-                playlist_entries.append(str(found_path))
+                playlist_entries.append(found_path.as_posix())
 
     if playlist_entries:
         with open(m3u_path, "w", encoding="utf-8") as fh:
