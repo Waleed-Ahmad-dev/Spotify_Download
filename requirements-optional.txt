@@ -1,0 +1,23 @@
+# Optional features — install only the ones you want:
+#     pip install -r requirements-optional.txt
+#
+# Every one of these is guarded with try/except in the code, so the app runs
+# perfectly well without them — they just unlock extra capabilities.
+
+# Better Hindi/Urdu → Hinglish lyric transliteration.
+# Without it, the code falls back to a built-in character map (see
+# transliterate_lyrics.py), so this is purely a quality upgrade.
+indic-transliteration>=2.3.37
+
+# Genius lyrics fallback (used when LRCLIB has nothing).
+# Also requires a GENIUS_API_KEY environment variable to do anything.
+lyricsgenius>=3.0.1
+
+# Whisper AI transcription — last-resort lyrics for songs with none online.
+# HEAVY: pulls in PyTorch (multiple GB). CPU-only works (the app sets fp16=False).
+openai-whisper>=20231117
+
+# Static ffmpeg binary, in case you'd rather not install ffmpeg system-wide.
+# NOTE: ships ffmpeg only (no ffprobe), so the dedupe/convert validity checks
+# still work best with a real install (e.g. `winget install Gyan.FFmpeg`).
+imageio-ffmpeg>=0.4.9
