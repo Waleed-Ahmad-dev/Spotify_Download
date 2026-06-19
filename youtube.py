@@ -44,7 +44,7 @@ from rich.progress import (
     TaskProgressColumn, TimeRemainingColumn,
 )
 
-from utils import console, sanitize_filename
+from utils import console, sanitize_filename, get_ffmpeg
 
 # ── yt-dlp version guard ──────────────────────────────────────────────────────
 _MIN_YTDLP_DATE = date(2024, 11, 1)   # anything older is likely to break
@@ -70,7 +70,7 @@ _check_ytdlp_version()
 
 # ── Silent logger — suppresses yt-dlp's raw stderr ERROR: lines ──────────────
 class _QuietLogger:
-    """Redirect all yt-dlp log output to /dev/null."""
+    """Swallow all yt-dlp log output (no-op logger)."""
     def debug(self, msg: str)   -> None: pass
     def info(self, msg: str)    -> None: pass
     def warning(self, msg: str) -> None: pass
@@ -383,7 +383,7 @@ def _convert_to_format(
     if normalize:
         filters.append("loudnorm=I=-14:LRA=11:TP=-1.0")
 
-    cmd: list[str] = ["ffmpeg", "-y", "-i", str(raw_file), "-c:a", codec]
+    cmd: list[str] = [get_ffmpeg(), "-y", "-i", str(raw_file), "-c:a", codec]
 
     if format_ext == "opus":
         cmd += ["-b:a", f"{quality}k", "-vbr", "on", "-compression_level", "10"]
