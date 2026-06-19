@@ -47,7 +47,7 @@ By integrating seamlessly with APIs like iTunes for track details and LRCLIB for
 
 ## Core Features
 
-- **Precision Spotify Recording (Linux Exclusive):** Integrates with the MPRIS D-Bus interface via `playerctl` to dynamically capture exact track titles and artist names directly from the active Spotify client. Features automated loop detection to gracefully terminate the recording phase.
+- **Precision Spotify Recording (Linux & Windows):** Captures exact track titles and artist names directly from the active **local Spotify desktop client** — no Spotify account or Web API required. On Linux it reads the MPRIS/D-Bus interface via `playerctl`; on Windows it reads the system media session (GSMTC) via the `winrt` bindings. Features automated loop detection to gracefully terminate the recording phase.
 - **Parallelized Retrieval Engine:** Utilizes Python's `concurrent.futures` to rapidly query YouTube and download audio streams. Automatically resolves rate-limiting and applies fallback mechanisms for maximum reliability.
 - **Multi-Format Lossless & Lossy Extraction:** Leverages `yt-dlp` and `FFmpeg` to extract audio directly into standard MP3, highly efficient M4A (AAC), or studio-quality FLAC containers.
 - **Industry Standard Audio Normalization:** Features optional integration with FFmpeg's `loudnorm` filter to normalize audio output to -14 LUFS, precisely matching Spotify's standard volume levels across diverse tracks.
@@ -69,8 +69,14 @@ Spotify_Download/
 ├── youtube.py
 ├── metadata.py
 ├── utils.py
+├── convert_to_opus.py
+├── transliterate_lyrics.py
 ├── requirements.txt
-├── build_deb.sh
+├── requirements-optional.txt
+├── run.bat                     # Windows double-click launcher
+├── build_windows.ps1           # Windows .exe build (PyInstaller)
+├── spotify_downloader.spec     # PyInstaller spec
+├── build_deb.sh                # Linux .deb build
 ├── deb_resources/
 │   ├── control
 │   └── spotify-downloader.desktop
@@ -83,8 +89,8 @@ Spotify_Download/
   - *Purpose:* The central orchestrator and primary Command Line Interface entry point.
   - *Functionality:* Handles argument parsing using `argparse`, deploys interactive format selection menus via `questionary`, and directs the sequential execution of the recording, searching, downloading, and tagging pipelines. Displays a comprehensive, color-coded summary table upon completion.
 - **`recorder.py`**
-  - *Purpose:* The system-level Spotify interface module.
-  - *Functionality:* Exclusively designed for Linux systems, it utilizes system subprocesses to execute `playerctl` commands. It actively monitors the MPRIS interface to capture the currently playing track and artist. Implements an intelligent loop-detection algorithm to autonomously stop recording when the playlist repeats.
+  - *Purpose:* The local Spotify-client interface module (cross-platform).
+  - *Functionality:* Captures the currently playing track + artist straight from the desktop Spotify app — no account or Web API. On Linux it runs `playerctl` against the MPRIS/D-Bus interface; on Windows it queries the system media session (GSMTC) through the `winrt` bindings. A shared, platform-agnostic loop with intelligent loop-detection autonomously stops when the playlist repeats.
 - **`youtube.py`**
   - *Purpose:* The search and high-speed retrieval engine.
   - *Functionality:* Harnesses `yt-dlp` to query YouTube for optimal official audio streams based on the recorded text files. Implements `ThreadPoolExecutor` for concurrent operations, significantly reducing total processing time. Handles stream extraction, format conversion via FFmpeg post-processing, and optional audio normalization parameters.
@@ -93,13 +99,22 @@ Spotify_Download/
   - *Functionality:* Interfaces with the iTunes Search API to resolve pristine track details and the LRCLIB API for localized lyrics. It utilizes the `mutagen` library to safely embed these complex data structures (including binary image data for cover art) directly into the file headers. Additionally, it processes filesystem operations to automatically organize outputs into artist-specific directories.
 - **`utils.py`**
   - *Purpose:* A centralized library of shared utility functions and system checks.
-  - *Functionality:* Manages the shared `rich.console` environment. Provides critical dependency validation (`check_ffmpeg`, `check_linux_requirements`). Contains the logic for sanitizing filesystem paths, generating `.m3u` playlists that retain original playback order, and hosts the sophisticated metadata-aware deduplication function (`remove_duplicates`).
+  - *Functionality:* Manages the shared `rich.console` environment (and forces UTF-8 output on Windows). Provides cross-platform dependency resolution (`check_ffmpeg`, `get_ffmpeg`/`get_ffprobe`, `check_recorder_requirements`). Contains the logic for sanitizing filesystem paths (incl. Windows reserved-name handling), generating `.m3u` playlists that retain original playback order, and the metadata-aware deduplication function (`remove_duplicates`).
+- **`convert_to_opus.py`**
+  - *Purpose:* Standalone / in-process batch Opus converter.
+  - *Functionality:* Recursively converts FLAC/MP3/M4A to space-efficient Opus VBR via FFmpeg, validates output with FFprobe, and prunes corrupt files. Runnable from the CLI or called in-process from the wizard.
+- **`transliterate_lyrics.py`**
+  - *Purpose:* Hindi/Urdu → Hinglish transliteration.
+  - *Functionality:* Detects Devanagari / Arabic script and converts it to colloquial Roman "Hinglish", using `indic-transliteration` when installed and falling back to a built-in character map otherwise.
 - **`requirements.txt`**
   - *Purpose:* Environment definition.
   - *Functionality:* Locks down exact Python dependency versions required for stability (e.g., `yt-dlp`, `mutagen`, `rich`, `questionary`).
 - **`build_deb.sh` & `deb_resources/`**
-  - *Purpose:* Deployment and distribution tooling.
+  - *Purpose:* Linux deployment and distribution tooling.
   - *Functionality:* A shell script configured to package the tool into a `.deb` installer for Debian/Ubuntu distributions, utilizing configuration files and standard `.desktop` entries located in `deb_resources` for seamless desktop integration.
+- **`run.bat`, `build_windows.ps1` & `spotify_downloader.spec`**
+  - *Purpose:* Windows launch & distribution tooling.
+  - *Functionality:* `run.bat` is a double-click launcher for source installs; `build_windows.ps1` + `spotify_downloader.spec` build a self-contained one-folder `.exe` via PyInstaller, bundling FFmpeg/FFprobe and the WinRT bindings.
 
 ---
 
@@ -111,7 +126,9 @@ The application relies on external binaries for media processing and system inte
 
 1. **Python 3.8+**
 2. **FFmpeg:** Strictly required for audio extraction, format conversion, and LUFS normalization.
-3. **Playerctl (Linux Only):** Strictly required if utilizing the `--record` feature to read from Spotify.
+3. **Recorder backend** (only needed for the `--record` feature):
+   - **Linux:** `playerctl`
+   - **Windows:** the `winrt` packages — installed automatically by `requirements.txt` (no extra step)
 
 **Installation on Debian/Ubuntu:**
 
@@ -131,6 +148,16 @@ sudo dnf install python3 python3-pip ffmpeg playerctl
 ```bash
 brew install python ffmpeg
 ```
+
+**Installation on Windows (winget / PowerShell):**
+
+```powershell
+winget install Python.Python.3.12    # if you don't already have Python
+winget install Gyan.FFmpeg           # puts ffmpeg + ffprobe on PATH
+```
+
+> No `playerctl` needed on Windows — recording uses the built-in Windows media
+> session (GSMTC) via the `winrt` packages from `requirements.txt`.
 
 ### Python Dependencies
 
@@ -185,18 +212,50 @@ If you are using a Debian-based Linux distribution, you can build and install a 
     sudo apt-get install -f
     ```
 
+### Option 3: Windows
+
+**Quick start (from source):**
+
+```powershell
+winget install Python.Python.3.12   # skip if you already have Python
+winget install Gyan.FFmpeg          # ffmpeg + ffprobe on PATH
+git clone https://github.com/Waleed-Ahmad-dev/Spotify_Download.git
+cd Spotify_Download
+pip install -r requirements.txt
+python main.py        # …or just double-click run.bat
+```
+
+Optional extras (Whisper lyrics, Genius, richer Hinglish):
+
+```powershell
+pip install -r requirements-optional.txt
+```
+
+**Build a standalone `.exe`** (so the target machine needs no Python):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File build_windows.ps1
+```
+
+The packaged app appears under `dist\spotify-downloader\` — distribute that whole
+folder. FFmpeg/FFprobe are bundled into it automatically when present on PATH.
+
 ---
 
 ## Command Line Interface (CLI) Usage
 
 The application is operated entirely through `main.py`. The modular design allows you to run individual stages or the entire pipeline autonomously.
 
-### 1. Recording Playlists (Linux Only)
+### 1. Recording Playlists (Linux & Windows)
 
-Capture your currently playing Spotify playlist. Ensure your Spotify client is running, playing the desired playlist, with **Shuffle OFF** and **Repeat ON**.
+Capture your currently playing Spotify playlist directly from the desktop app (no account/API). Ensure the Spotify client is running and playing the desired playlist, with **Shuffle OFF** and **Repeat ON**.
 
 ```bash
+# Linux
 python3 main.py --record --input my_playlist.txt
+
+# Windows
+python main.py --record --input my_playlist.txt
 ```
 
 ### 2. Searching Tracks
