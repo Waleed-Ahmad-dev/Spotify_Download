@@ -10,6 +10,16 @@ import sys
 import argparse
 from pathlib import Path
 
+# ── Windows console: force UTF-8 ──────────────────────────────────────────────
+# Emoji and box-drawing characters (used throughout Rich output and the plain
+# print() fallbacks below) raise UnicodeEncodeError on legacy cp1252 consoles.
+if sys.platform.startswith("win"):
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
 # ── Dependency check ──────────────────────────────────────────────────────────
 try:
     import yt_dlp
@@ -275,7 +285,7 @@ def _wizard():
 
     # ── Convert branch ────────────────────────────────────────────────────────
     if mode == MODE_CONVERT:
-        import subprocess as _sp
+        import convert_to_opus
         source_dir = _ask_path("Folder containing audio files", "songs")
         quality = _ask_select(
             "Opus quality preset",
@@ -288,11 +298,13 @@ def _wizard():
         )
         keep = _ask_confirm("Keep original files after conversion?", default=False)
         dry  = _ask_confirm("Dry-run first (preview without converting)?", default=False)
-        cmd  = [sys.executable, "convert_to_opus.py",
-                "--dir", str(source_dir), "--quality", quality]
-        if keep: cmd.append("--keep-originals")
-        if dry:  cmd.append("--dry-run")
-        _sp.run(cmd)
+        # Call in-process (works under a frozen .exe and regardless of CWD)
+        convert_to_opus.run(
+            directory=str(source_dir),
+            quality=quality,
+            keep_originals=keep,
+            dry_run=dry,
+        )
         return
 
     # ── Common path questions ─────────────────────────────────────────────────
@@ -310,7 +322,7 @@ def _wizard():
             "How will you provide the song list?",
             choices=[
                 {"name": "✏️   Type song names here (manual entry)",          "value": "manual"},
-                {"name": "🎙️  Record from Spotify via playerctl (Linux only)", "value": "record"},
+                {"name": "🎙️  Record from the Spotify app (Linux & Windows)", "value": "record"},
                 {"name": "📄  Use existing songs.txt (already have one)",      "value": "existing"},
             ],
         )
