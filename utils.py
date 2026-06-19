@@ -242,7 +242,7 @@ def generate_m3u(
     console.print(f"\n[bold cyan]--- Generating Playlist: {m3u_path.name} ---[/bold cyan]")
 
     try:
-        with open(original_order_file, "r", encoding="utf-8") as fh:
+        with open(original_order_file, "r", encoding="utf-8-sig") as fh:
             lines = [ln.strip() for ln in fh if ln.strip()]
     except Exception as exc:
         console.print(f"[bold red]❌ Could not read order file:[/bold red] {exc}")
