@@ -22,6 +22,18 @@ from mutagen.mp4  import MP4
 from rich.console import Console
 from rich.panel   import Panel
 
+# ── Windows console: force UTF-8 ──────────────────────────────────────────────
+# Emoji / box-drawing characters raise UnicodeEncodeError on legacy cp1252
+# consoles.  This lives in the shared module every entry point imports, so it
+# also covers standalone scripts (e.g. convert_to_opus.py) and the Rich console
+# created just below.
+if sys.platform.startswith("win"):
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+
 # Shared Rich console for the entire application
 console = Console()
 
@@ -189,16 +201,21 @@ def check_recorder_requirements() -> bool:
         )
         return False
     if IS_WINDOWS:
-        try:
-            import winsdk.windows.media.control  # noqa: F401
-            return True
-        except Exception:
-            console.print(
-                "[bold yellow]⚠️  WARNING:[/bold yellow] "
-                "Windows recording needs the 'winsdk' package.\n"
-                "   Install it:  [cyan]pip install winsdk[/cyan]"
-            )
-            return False
+        # Prefer the modern per-namespace winrt-* packages (ship wheels for
+        # current Pythons); fall back to the older monolithic winsdk.
+        for _mod in ("winrt.windows.media.control", "winsdk.windows.media.control"):
+            try:
+                __import__(_mod)
+                return True
+            except Exception:
+                continue
+        console.print(
+            "[bold yellow]⚠️  WARNING:[/bold yellow] "
+            "Windows recording needs the WinRT bindings.\n"
+            "   Install:  [cyan]pip install winrt-Windows.Media.Control "
+            "winrt-Windows.Foundation winrt-Windows.Foundation.Collections[/cyan]"
+        )
+        return False
     console.print(
         "[bold yellow]⚠️  WARNING:[/bold yellow] "
         "Auto-recording from the Spotify app isn't supported on this platform.\n"
