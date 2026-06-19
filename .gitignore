@@ -1,4 +1,36 @@
+# ── Python ──────────────────────────────────────────────────────────────────
 venv
-music_tagger
+.venv
 __pycache__
+*.pyc
+
+# ── Local tooling / editor state (never committed) ───────────────────────────
+.claude/
+music_tagger
 project_dump.txt
+
+# ── Build artifacts ──────────────────────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+
+# ── Bundled binaries (ffmpeg/ffprobe for the .exe — too large for git) ───────
+vendor/
+
+# ── Runtime outputs (song lists, playlists, lyrics) ──────────────────────────
+songs/
+songs.txt
+found.txt
+not_found.txt
+*.m3u
+*.lrc
+
+# ── Downloaded audio ─────────────────────────────────────────────────────────
+*.mp3
+*.flac
+*.m4a
+*.opus
+*.wav
+*.webm
+*.ogg
+*.aac
