@@ -20,12 +20,19 @@ Usage examples
   python convert_to_opus.py --keep-originals
   python convert_to_opus.py --dry-run
   python convert_to_opus.py --dir /path/to/music
+
+It can also be driven in-process (e.g. from the main wizard):
+  import convert_to_opus
+  convert_to_opus.run(directory="songs", quality="best")
 """
 
 import argparse
 import subprocess
 import sys
 from pathlib import Path
+from typing import List, Optional
+
+from utils import get_ffmpeg, get_ffprobe
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 DEFAULT_SONGS_DIR = Path("songs")
@@ -48,7 +55,7 @@ def is_valid_opus(path: Path) -> bool:
         return False
     result = subprocess.run(
         [
-            "ffprobe", "-v", "error",
+            get_ffprobe(), "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(path),
@@ -72,7 +79,7 @@ def convert(source: Path, bitrate: str) -> bool:
     """
     opus = source.with_suffix(".opus")
     cmd = [
-        "ffmpeg", "-i", str(source),
+        get_ffmpeg(), "-i", str(source),
         "-c:a",               "libopus",
         "-b:a",               bitrate,
         "-vbr",               "on",
@@ -86,7 +93,140 @@ def convert(source: Path, bitrate: str) -> bool:
     return result.returncode == 0 and is_valid_opus(opus)
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Core routine (callable in-process) ────────────────────────────────────────
+
+def run(
+    directory: str = str(DEFAULT_SONGS_DIR),
+    quality: str = "best",
+    also: Optional[List[str]] = None,
+    keep_originals: bool = False,
+    dry_run: bool = False,
+) -> None:
+    """Scan *directory* and convert source audio files to Opus VBR."""
+    also = also or []
+
+    songs_dir = Path(directory)
+    if not songs_dir.exists():
+        print(f"❌  Directory '{songs_dir}' not found.")
+        sys.exit(1)
+
+    bitrate = QUALITY_PRESETS[quality]
+
+    # Build the set of source extensions to process
+    source_exts = {"flac"}
+    for ext in also:
+        ext = ext.lstrip(".").lower()
+        if ext in SUPPORTED_EXTRA:
+            source_exts.add(ext)
+        else:
+            print(f"⚠️   Ignoring unknown extension: '{ext}'")
+
+    print(f"\n🔍  Scanning '{songs_dir}' …")
+    print(f"    Source formats : {', '.join(sorted(e.upper() for e in source_exts))}")
+    print(f"    Opus bitrate   : {bitrate} VBR")
+    print(f"    Keep originals : {keep_originals}")
+    print(f"    Dry-run        : {dry_run}")
+    print()
+
+    # Collect all source files and existing Opus files
+    all_sources: List[Path] = []
+    for ext in source_exts:
+        all_sources.extend(sorted(songs_dir.rglob(f"*.{ext}")))
+    all_opus = sorted(songs_dir.rglob("*.opus"))
+
+    print(f"    Found {len(all_sources)} source file(s)")
+    print(f"    Found {len(all_opus)} existing Opus file(s)\n")
+
+    # ── Step 1: find and delete corrupt / incomplete Opus files ──────────────
+    corrupt: List[Path] = []
+    for opus in all_opus:
+        if not is_valid_opus(opus):
+            corrupt.append(opus)
+
+    if corrupt:
+        print(f"⚠️   Found {len(corrupt)} corrupt/incomplete Opus file(s):\n")
+        for f in corrupt:
+            print(f"    🗑️  {f}")
+            if not dry_run:
+                f.unlink()
+        print()
+    else:
+        print("✅  No corrupt Opus files found.\n")
+
+    # ── Step 2: build conversion plan ────────────────────────────────────────
+    to_convert:   List[Path] = []
+    already_done: List[Path] = []
+
+    for src in all_sources:
+        if is_valid_opus(src.with_suffix(".opus")):
+            already_done.append(src)
+        else:
+            to_convert.append(src)
+
+    print("📊  Conversion plan:")
+    print(f"    Already converted (skip) : {len(already_done)}")
+    print(f"    Need conversion          : {len(to_convert)}\n")
+
+    if not to_convert:
+        print("🎉  Nothing to do — all source files already have valid Opus counterparts.")
+        return
+
+    if dry_run:
+        print("🔎  Dry-run — files that WOULD be converted:\n")
+        for src in to_convert:
+            opus_size_estimate = (
+                src.stat().st_size * 0.35
+                if quality == "best"
+                else src.stat().st_size * 0.25
+            )
+            print(
+                f"    {src.suffix.upper()[1:]:5s} → Opus  "
+                f"{src.stat().st_size / 1_048_576:.1f} MB → "
+                f"~{opus_size_estimate / 1_048_576:.1f} MB   {src}"
+            )
+        print()
+        return
+
+    # ── Step 3: convert ───────────────────────────────────────────────────────
+    succeeded: List[Path] = []
+    failed:    List[Path] = []
+
+    for idx, src in enumerate(to_convert, 1):
+        label = f"[{idx}/{len(to_convert)}]"
+        src_mb = src.stat().st_size / 1_048_576
+        print(
+            f"{label}  {src.suffix.upper()[1:]} → Opus  "
+            f"({src_mb:.1f} MB)  {src.name}",
+            end="  … ", flush=True,
+        )
+        if convert(src, bitrate):
+            opus_path = src.with_suffix(".opus")
+            opus_mb   = opus_path.stat().st_size / 1_048_576 if opus_path.exists() else 0
+            saving    = (1 - opus_mb / src_mb) * 100 if src_mb else 0
+            print(f"✅ done  ({opus_mb:.1f} MB, saved {saving:.0f}%)")
+            succeeded.append(src)
+            if not keep_originals:
+                src.unlink()
+        else:
+            print("❌ FAILED (original kept)")
+            failed.append(src)
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    print("\n" + "─" * 60)
+    print("🎉  Conversion complete!")
+    print(f"    Converted  : {len(succeeded)} file(s)  →  Opus {bitrate} VBR")
+    print(f"    Skipped    : {len(already_done)} (already converted)")
+    print(f"    Failed     : {len(failed)} (originals preserved)")
+    if not keep_originals and succeeded:
+        print(f"    Originals  : deleted ({len(succeeded)} file(s) removed)")
+    if failed:
+        print("\n  Failed files:")
+        for f in failed:
+            print(f"    • {f}")
+    print()
+
+
+# ── CLI entry point ───────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -118,125 +258,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    songs_dir = Path(args.dir)
-    if not songs_dir.exists():
-        print(f"❌  Directory '{songs_dir}' not found.")
-        sys.exit(1)
-
-    bitrate = QUALITY_PRESETS[args.quality]
-
-    # Build the set of source extensions to process
-    source_exts = {"flac"}
-    for ext in args.also:
-        ext = ext.lstrip(".").lower()
-        if ext in SUPPORTED_EXTRA:
-            source_exts.add(ext)
-        else:
-            print(f"⚠️   Ignoring unknown extension: '{ext}'")
-
-    print(f"\n🔍  Scanning '{songs_dir}' …")
-    print(f"    Source formats : {', '.join(sorted(e.upper() for e in source_exts))}")
-    print(f"    Opus bitrate   : {bitrate} VBR")
-    print(f"    Keep originals : {args.keep_originals}")
-    print(f"    Dry-run        : {args.dry_run}")
-    print()
-
-    # Collect all source files and existing Opus files
-    all_sources: list[Path] = []
-    for ext in source_exts:
-        all_sources.extend(sorted(songs_dir.rglob(f"*.{ext}")))
-    all_opus = sorted(songs_dir.rglob("*.opus"))
-
-    print(f"    Found {len(all_sources)} source file(s)")
-    print(f"    Found {len(all_opus)} existing Opus file(s)\n")
-
-    # ── Step 1: find and delete corrupt / incomplete Opus files ──────────────
-    corrupt: list[Path] = []
-    for opus in all_opus:
-        if not is_valid_opus(opus):
-            corrupt.append(opus)
-
-    if corrupt:
-        print(f"⚠️   Found {len(corrupt)} corrupt/incomplete Opus file(s):\n")
-        for f in corrupt:
-            print(f"    🗑️  {f}")
-            if not args.dry_run:
-                f.unlink()
-        print()
-    else:
-        print("✅  No corrupt Opus files found.\n")
-
-    # ── Step 2: build conversion plan ────────────────────────────────────────
-    to_convert:   list[Path] = []
-    already_done: list[Path] = []
-
-    for src in all_sources:
-        if is_valid_opus(src.with_suffix(".opus")):
-            already_done.append(src)
-        else:
-            to_convert.append(src)
-
-    print("📊  Conversion plan:")
-    print(f"    Already converted (skip) : {len(already_done)}")
-    print(f"    Need conversion          : {len(to_convert)}\n")
-
-    if not to_convert:
-        print("🎉  Nothing to do — all source files already have valid Opus counterparts.")
-        return
-
-    if args.dry_run:
-        print("🔎  Dry-run — files that WOULD be converted:\n")
-        for src in to_convert:
-            opus_size_estimate = (
-                src.stat().st_size * 0.35
-                if args.quality == "best"
-                else src.stat().st_size * 0.25
-            )
-            print(
-                f"    {src.suffix.upper()[1:]:5s} → Opus  "
-                f"{src.stat().st_size / 1_048_576:.1f} MB → "
-                f"~{opus_size_estimate / 1_048_576:.1f} MB   {src}"
-            )
-        print()
-        return
-
-    # ── Step 3: convert ───────────────────────────────────────────────────────
-    succeeded: list[Path] = []
-    failed:    list[Path] = []
-
-    for idx, src in enumerate(to_convert, 1):
-        label = f"[{idx}/{len(to_convert)}]"
-        src_mb = src.stat().st_size / 1_048_576
-        print(
-            f"{label}  {src.suffix.upper()[1:]} → Opus  "
-            f"({src_mb:.1f} MB)  {src.name}",
-            end="  … ", flush=True,
-        )
-        if convert(src, bitrate):
-            opus_path = src.with_suffix(".opus")
-            opus_mb   = opus_path.stat().st_size / 1_048_576 if opus_path.exists() else 0
-            saving    = (1 - opus_mb / src_mb) * 100 if src_mb else 0
-            print(f"✅ done  ({opus_mb:.1f} MB, saved {saving:.0f}%)")
-            succeeded.append(src)
-            if not args.keep_originals:
-                src.unlink()
-        else:
-            print("❌ FAILED (original kept)")
-            failed.append(src)
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    print("\n" + "─" * 60)
-    print("🎉  Conversion complete!")
-    print(f"    Converted  : {len(succeeded)} file(s)  →  Opus {bitrate} VBR")
-    print(f"    Skipped    : {len(already_done)} (already converted)")
-    print(f"    Failed     : {len(failed)} (originals preserved)")
-    if not args.keep_originals and succeeded:
-        print(f"    Originals  : deleted ({len(succeeded)} file(s) removed)")
-    if failed:
-        print("\n  Failed files:")
-        for f in failed:
-            print(f"    • {f}")
-    print()
+    run(
+        directory=args.dir,
+        quality=args.quality,
+        also=args.also,
+        keep_originals=args.keep_originals,
+        dry_run=args.dry_run,
+    )
 
 
 if __name__ == "__main__":
